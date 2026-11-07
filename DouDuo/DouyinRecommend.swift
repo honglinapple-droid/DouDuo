@@ -170,6 +170,10 @@ final class DYRecommender {
         DYLiveModel.log("DDREC seeded h=\(history.count) l=\(likes.count) c=\(collects.count) top=\(p.topTags)")
     }
 
+    /// 配比的滚动窗口：最近放出的 30 条（已关注 / 横屏 / 主标签）
+    struct Window { let followed: Bool; let land: Bool; let tag: String }
+    private var recentWindow: [Window] = []
+
     // 旁路备用池：相关推荐 / 关注 两路在后台慢慢拉，拉到打好分放这里，主线每塞一页就从这儿插几条
     private var pool: [(a: DYAweme, score: Double)] = []
     private var refilling = false
@@ -201,37 +205,60 @@ final class DYRecommender {
             if top.a.images.isEmpty && !top.a.isPortrait && portraitMode == 2 { continue }
             ids.insert(top.a.id); extras.append(top.a)
         }
-        let scored = (cands.map { ($0, p.score($0) + Double.random(in: -0.15...0.15)) } + extras.map { ($0, p.score($0) + 0.6) }).sorted { $0.1 > $1.1 }
-        // 配比上限：已关注 ≤ 20%，单一分类 ≤ 30%，横屏 ≤ 20%
-        let n = scored.count
-        let capFollow = max(1, Int(Double(n) * 0.2)), capTag = max(2, Int(Double(n) * 0.3)), capLand = max(1, Int(Double(n) * 0.2))
-        var out: [DYAweme] = [], nFollow = 0, nLand = 0, tagCount: [String: Int] = [:], dropped: [DYAweme] = []
+        // 全部模式：横屏不删，但在排序里往后沉（b44 后用户反馈横屏变多）
+        let landPenalty: (DYAweme) -> Double = { (portraitMode == 0 && $0.images.isEmpty && !$0.isPortrait) ? -0.8 : 0 }
+        let scored = (cands.map { ($0, p.score($0) + landPenalty($0) + Double.random(in: -0.15...0.15)) } + extras.map { ($0, p.score($0) + landPenalty($0) + 0.6) }).sorted { $0.1 > $1.1 }
+        // 配比上限：已关注 ≤ 20%，单一分类 ≤ 30%，横屏 ≤ 20%。
+        // b46：按"最近放出的 30 条 + 本批"滚动算，不再按单批算——单批去重后只剩几条时，两成算出来就是 1 条，
+        // 用户关注 3441 人、候选几乎全是已关注作者，结果每批 20 条只放出 1 条（模拟器日志 191 批里 178 批 out=1），列表断货。
+        var out: [DYAweme] = [], dropped: [DYAweme] = []
+        func share(_ pred: (Window) -> Bool, plusOne: Bool) -> Double {
+            let all = recentWindow + out.map { Window(followed: isFollowed($0), land: $0.images.isEmpty && !$0.isPortrait, tag: $0.tags?.first ?? "") }
+            let total = all.count + 1, hit = all.filter(pred).count + 1
+            return total < 6 ? 0 : Double(hit) / Double(total)
+        }
         for (a, _) in scored {
             let f = isFollowed(a), land = a.images.isEmpty && !a.isPortrait, main = a.tags?.first ?? ""
-            if f && nFollow >= capFollow { dropped.append(a); continue }
-            if land && nLand >= capLand { dropped.append(a); continue }
-            if !main.isEmpty && tagCount[main, default: 0] >= capTag { dropped.append(a); continue }
-            out.append(a); if f { nFollow += 1 }; if land { nLand += 1 }; if !main.isEmpty { tagCount[main, default: 0] += 1 }
+            if f && share({ $0.followed }, plusOne: true) > 0.2 { dropped.append(a); continue }
+            if land && share({ $0.land }, plusOne: true) > 0.2 { dropped.append(a); continue }
+            if !main.isEmpty && share({ $0.tag == main }, plusOne: true) > 0.3 { dropped.append(a); continue }
+            out.append(a)
         }
+        // 回填：一批放出不足 6 条就把被配比扣下的按分数补回来，宁可配比松一点也不能断货
+        var backfilled = 0, nLandOut = out.filter { $0.images.isEmpty && !$0.isPortrait }.count
+        while out.count < 6, !dropped.isEmpty {
+            let a = dropped.removeFirst(), land = a.images.isEmpty && !a.isPortrait
+            if land && portraitMode != 0 && nLandOut >= 2 { continue }   // 竖屏优先：回填时横屏一批最多 2 条，别把横屏灌进来
+            out.append(a); backfilled += 1; if land { nLandOut += 1 }
+        }
+        recentWindow += out.map { Window(followed: isFollowed($0), land: $0.images.isEmpty && !$0.isPortrait, tag: $0.tags?.first ?? "") }
+        if recentWindow.count > 30 { recentWindow.removeFirst(recentWindow.count - 30) }
+        let nFollow = out.filter(isFollowed).count, nLand = out.filter { $0.images.isEmpty && !$0.isPortrait }.count
         // 被配比挤掉的别浪费，扔回备用池（分数打折），下次人少了再上
         for a in dropped.prefix(10) { pool.append((a, p.score(a) - 1)) }
         if pool.count > 60 { pool.sort { $0.score > $1.score }; pool.removeLast(pool.count - 60) }
-        DYLiveModel.log("DDREC rank in=\(page.count) cands=\(cands.count) extras=\(extras.count) out=\(out.count) follow=\(nFollow) land=\(nLand) pool=\(pool.count)")
+        DYLiveModel.log("DDREC rank in=\(page.count) cands=\(cands.count) extras=\(extras.count) out=\(out.count) backfill=\(backfilled) follow=\(nFollow) land=\(nLand) pool=\(pool.count)")
         return out
     }
 
     /// 后台补备用池：相关推荐（拿最近正向的种子问）+ 关注的人。不重试，拉不到就算；主线不等它
-    private var lastRefill: Date = .distantPast
+    private var lastRelated: Date = .distantPast, lastFollow: Date = .distantPast
     func refillPool(_ bridge: DouyinBridge, loggedIn: Bool) {
-        // 最多三分钟补一次，一次 2 个请求（相关推荐 1 + 关注 1），且都排在串行队列里，不和主线抢
-        guard !refilling, pool.count < 8, Date().timeIntervalSince(lastRefill) > 180 else { return }
-        refilling = true; lastRefill = Date()
+        // 相关推荐（回包很小、全是对口味的竖屏）1 分钟一次；关注流（页大）3 分钟一次。都排在串行队列里，不和主线抢。
+        // b44 把两路都放慢到 3 分钟后池子常空，每页插进来的对口味竖屏没了，用户反馈"横屏变多、不对口味"
+        let now = Date()
+        let doRelated = now.timeIntervalSince(lastRelated) > 60
+        let doFollow = loggedIn && now.timeIntervalSince(lastFollow) > 180
+        guard !refilling, pool.count < 12, doRelated || doFollow else { return }
+        refilling = true
+        if doRelated { lastRelated = now }
+        if doFollow { lastFollow = now }
         Task {
             defer { refilling = false }
             let p = DYTasteProfile.shared
-            let seeds = Array(p.positives.shuffled().prefix(1))
+            let seeds = doRelated ? Array(p.positives.shuffled().prefix(1)) : []
             async let r1: [DYAweme] = seeds.indices.contains(0) ? ((try? await bridge.related(seeds[0])) ?? []) : []
-            async let f1: [DYAweme] = loggedIn ? ((try? await bridge.followFeed(cursor: followCursor))?.items ?? []) : []
+            async let f1: [DYAweme] = doFollow ? ((try? await bridge.followFeed(cursor: followCursor))?.items ?? []) : []
             let (a, f) = await (r1, f1)
             let b: [DYAweme] = []
             let blocked = DYTaste.blockedAuthors

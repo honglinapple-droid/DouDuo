@@ -770,7 +770,19 @@ struct DYEdgeSwipeBack: ViewModifier {
         }
     }
 }
+/// 整屏右滑返回（b46）：任意位置向右滑过 90pt、竖向偏移小于 70pt 就返回。
+/// 之前只有最左 24pt 一条带手势的透明条——它会吞掉底下返回箭头的点击，搜索 / 我的 / 作者页的返回键因此点不动，
+/// 消息 / 聊天的返回键一半在条下所以时灵时不灵。视频列表页横滑是快进，仍用边缘条。
+struct DYSwipeBack: ViewModifier {
+    let action: () -> Void
+    func body(content: Content) -> some View {
+        content.simultaneousGesture(DragGesture(minimumDistance: 24).onEnded { v in
+            if v.translation.width > 90, abs(v.translation.height) < 70, v.translation.width > abs(v.translation.height) * 2 { action() }
+        })
+    }
+}
 extension View {
+    func swipeBack(_ action: @escaping () -> Void) -> some View { modifier(DYSwipeBack(action: action)) }
     func edgeSwipeBack(_ action: @escaping () -> Void) -> some View { modifier(DYEdgeSwipeBack(action: action)) }
 }
 
@@ -843,7 +855,7 @@ struct DYMessagesScreen: View {
                 }
             }
             .background(dyBG.ignoresSafeArea())
-            .edgeSwipeBack { onClose() }
+            .swipeBack { onClose() }
             .navigationDestination(item: $open) { c in
                 DYChatScreen(im: im, bridge: bridge, conversation: c, onBack: { open = nil }, onAuthor: onAuthor)
             }
@@ -969,7 +981,7 @@ struct DYChatScreen: View {
         .background(dyBG.ignoresSafeArea())
         .navigationBarBackButtonHidden(true)
         .toolbar(.hidden, for: .navigationBar)
-        .edgeSwipeBack { focused = false; onBack() }
+        .swipeBack { focused = false; onBack() }
         .overlay(alignment: .top) {
             if let toast {
                 Text(toast).font(.footnote).foregroundStyle(.white).padding(.horizontal, 14).padding(.vertical, 8)
@@ -1071,9 +1083,17 @@ struct DYChatScreen: View {
         default:
             HStack(alignment: .top, spacing: 8) {
                 if m.fromMe { Spacer(minLength: 50) } else { avatar(m.avatar ?? conversation.avatar, size: 36) }
-                content(m)
-                    .contentShape(Rectangle())
-                    .simultaneousGesture(LongPressGesture(minimumDuration: 0.4).onEnded { _ in longPress(m) })
+                if m.kind == .share || m.kind == .video {
+                    // 视频卡片：长按出菜单、点一下才打开——互斥，松手不会再把视频打开（b45 之前长按松手视频必弹）
+                    content(m)
+                        .contentShape(Rectangle())
+                        .gesture(LongPressGesture(minimumDuration: 0.4).onEnded { _ in longPress(m) }
+                            .exclusively(before: TapGesture().onEnded { openCard(m) }))
+                } else {
+                    content(m)
+                        .contentShape(Rectangle())
+                        .simultaneousGesture(LongPressGesture(minimumDuration: 0.4).onEnded { _ in longPress(m) })
+                }
                 if m.fromMe { avatar(m.avatar ?? im.myAvatar, size: 36) } else { Spacer(minLength: 50) }
             }
         }
@@ -1083,7 +1103,7 @@ struct DYChatScreen: View {
     private func content(_ m: DYIMMessage) -> some View {
         switch m.kind {
         case .share, .video:
-            Button { openCard(m) } label: {
+            Group {
                 VStack(alignment: .leading, spacing: 0) {
                     CachedAsyncImage(url: m.cover.flatMap(URL.init(string:))) { img in img.resizable().scaledToFill() } placeholder: { dyBubble }
                         .frame(width: 150, height: 200).clipped()

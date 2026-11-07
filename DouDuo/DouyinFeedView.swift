@@ -863,6 +863,7 @@ struct DouyinFeedScreen: View {
     @State private var showComments = false
     /// 当前条正在长按 2 倍速：顶栏跟着藏起来（沉浸）
     @State private var boosting = false
+    @State private var followPanelInset: CGFloat = 0
     @State private var saveTask: Task<Void, Never>?
     @State private var web: DYWebTarget?
     @State private var tab: DYTab = ProcessInfo.processInfo.environment["DOUDUO_STARTLIVE"] == "1" ? .live : .recommend
@@ -1201,13 +1202,14 @@ struct DouyinFeedScreen: View {
                              onLogin: { web = DYWebTarget(url: DouyinWeb.home) },
                              onToast: { showToast($0) },
                              onShare: { shareTarget = $0 },
-                             onBoost: { boosting = $0 })
+                             onBoost: { boosting = $0 },
+                             onCommentsPanel: { followPanelInset = $0 })
             } else {
                 recommendArea
             }
             topBar.padding(.top, 10)
+                .padding(.trailing, tab == .follow ? followPanelInset : 0)   // 关注页分屏评论开着时让位给面板
                 .opacity(boosting ? 0 : 1)
-                .allowsHitTesting(!boosting)
                 .animation(.easeInOut(duration: 0.2), value: boosting)
             if let t = feed.toast {
                 Text(t).font(.footnote.weight(.medium)).foregroundStyle(.white)
@@ -1368,7 +1370,8 @@ struct DouyinFeedScreen: View {
                                         followed: item.author.secUid.map { feed.followed.contains($0) } ?? false,
                                         onFollow: { follow(item.author) },
                                         onShare: { shareTarget = item },
-                                        onBoost: { boosting = $0 })
+                                        onBoost: { boosting = $0 },
+                                        onEdgeBack: { if showComments { withAnimation(.snappy) { showComments = false } } })
                             .containerRelativeFrame([.horizontal, .vertical])
                             .id(item.id)
                         }
@@ -2006,6 +2009,8 @@ struct DYVideoPage: View {
     let onShare: (() -> Void)?
     /// 长按 2 倍速进 / 出（外层藏顶栏用）
     let onBoost: ((Bool) -> Void)?
+    /// 视频区左缘右滑（收起分屏评论）
+    let onEdgeBack: (() -> Void)?
     @State private var heart = false
     /// 正在 2 倍速：文案和右侧按钮淡出（沉浸）
     @State private var boosting = false
@@ -2025,8 +2030,8 @@ struct DYVideoPage: View {
          onComments: @escaping () -> Void, onAuthor: @escaping () -> Void, onSavePosition: @escaping (Double) -> Void,
          preloader: DYPreloader, bridge: DouyinBridge? = nil, onToast: ((String) -> Void)? = nil,
          onDislike: (() -> Void)? = nil, followed: Bool = false, onFollow: (() -> Void)? = nil, onShare: (() -> Void)? = nil,
-         onBoost: ((Bool) -> Void)? = nil) {
-        self.followed = followed; self.onFollow = onFollow; self.onShare = onShare; self.onBoost = onBoost
+         onBoost: ((Bool) -> Void)? = nil, onEdgeBack: (() -> Void)? = nil) {
+        self.followed = followed; self.onFollow = onFollow; self.onShare = onShare; self.onBoost = onBoost; self.onEdgeBack = onEdgeBack
         self.item = item; self.isCurrent = isCurrent; self.insets = insets; self.resume = resume
         self.liked = liked; self.collected = collected
         self.onLike = onLike; self.onCollect = onCollect; self.onDoubleTap = onDoubleTap
@@ -2050,6 +2055,7 @@ struct DYVideoPage: View {
                                         withAnimation(.easeInOut(duration: 0.2)) { boosting = on }
                                         onBoost?(on)
                                     },
+                                    onEdgeBack: onEdgeBack,
                                     onEnded: nil,
                                     onDoubleTap: {
                                         onDoubleTap()
@@ -2313,6 +2319,9 @@ struct DYCommentPanel: View {
     @State private var replyTo: DYComment?
     @State private var sending = false
     @State private var sendErr: String?
+    /// 乐观显示：正在发送中的本地评论 id；发失败的留着原文可重发
+    @State private var pending: Set<String> = []
+    @State private var failedDrafts: [String: (text: String, replyID: String?)] = [:]
     @FocusState private var inputFocused: Bool
 
     init(bridge: DouyinBridge, aweme: DYAweme, onClose: (() -> Void)?) {
@@ -2320,7 +2329,10 @@ struct DYCommentPanel: View {
     }
 
     var body: some View {
-        panelBody.edgeSwipeBack { onClose?() }
+        // 面板内横向一滑（左右都行）就收起；之前只有最左 24pt 的边缘条
+        panelBody.simultaneousGesture(DragGesture(minimumDistance: 24).onEnded { v in
+            if abs(v.translation.width) > 80, abs(v.translation.height) < 70 { onClose?() }
+        })
     }
 
     private var panelBody: some View {
@@ -2400,22 +2412,29 @@ struct DYCommentPanel: View {
         .padding(.horizontal, 12).padding(.vertical, 8)
     }
 
+    /// 发评论：点发送立刻显示在列表顶部（标"发送中…"），后台等抖音确认再换成正式的；失败标红、可点重发
     private func send() async {
         let text = draft.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !sending else { return }
-        sending = true
-        defer { sending = false }
+        guard !text.isEmpty else { return }
+        let parent = replyTo
+        let temp = DYComment(id: "local-" + UUID().uuidString, text: text, name: "我", avatar: nil, digg: 0,
+                             time: Date().timeIntervalSince1970, replies: 0, ip: nil)
+        if let parent { replies[parent.id, default: []].insert(temp, at: 0) } else { items.insert(temp, at: 0); total += 1 }
+        pending.insert(temp.id)
+        draft = ""; replyTo = nil; sendErr = nil
+        inputFocused = false
+        await deliver(temp, parentID: parent?.id, text: text)
+    }
+
+    private func deliver(_ temp: DYComment, parentID: String?, text: String) async {
         do {
-            let c = try await bridge.publishComment(aweme.id, text: text, replyID: replyTo?.id)
-            if let parent = replyTo {
-                replies[parent.id, default: []].insert(c, at: 0)
-            } else {
-                items.insert(c, at: 0)
-                total += 1
-            }
-            draft = ""; replyTo = nil; sendErr = nil
-            inputFocused = false
+            let c = try await bridge.publishComment(aweme.id, text: text, replyID: parentID)
+            if let parentID, let i = replies[parentID]?.firstIndex(where: { $0.id == temp.id }) { replies[parentID]?[i] = c }
+            else if let i = items.firstIndex(where: { $0.id == temp.id }) { items[i] = c }
+            pending.remove(temp.id); failedDrafts[temp.id] = nil
         } catch {
+            pending.remove(temp.id)
+            failedDrafts[temp.id] = (text, parentID)
             sendErr = "发送失败：\(error.localizedDescription)"
         }
     }
@@ -2423,7 +2442,7 @@ struct DYCommentPanel: View {
     private func row(_ c: DYComment) -> some View {
         rowBody(c)
             .contentShape(Rectangle())
-            .onTapGesture { replyTo = c; inputFocused = true }
+            .onTapGesture { guard !c.id.hasPrefix("local-") else { return }; replyTo = c; inputFocused = true }
     }
 
     private func rowBody(_ c: DYComment) -> some View {
@@ -2435,11 +2454,20 @@ struct DYCommentPanel: View {
                 Text(c.name).font(.caption.weight(.semibold)).foregroundStyle(.themeTextSecondary)
                 DYEmojiText(text: c.text, font: .subheadline, color: .themeTextPrimary, size: 18)
                     .fixedSize(horizontal: false, vertical: true)
-                HStack(spacing: 8) {
-                    Text(DYFormat.time(c.time))
-                    if let ip = c.ip, !ip.isEmpty { Text(ip) }
+                if pending.contains(c.id) {
+                    Text("发送中…").font(.caption2).foregroundStyle(.themeTextSecondary)
+                } else if let d = failedDrafts[c.id] {
+                    Button {
+                        Task { pending.insert(c.id); failedDrafts[c.id] = nil; await deliver(c, parentID: d.replyID, text: d.text) }
+                    } label: { Text("发送失败，点此重发").font(.caption2).foregroundStyle(.red) }
+                    .buttonStyle(.plain)
+                } else {
+                    HStack(spacing: 8) {
+                        Text(DYFormat.time(c.time))
+                        if let ip = c.ip, !ip.isEmpty { Text(ip) }
+                    }
+                    .font(.caption2).foregroundStyle(.themeTextSecondary)
                 }
-                .font(.caption2).foregroundStyle(.themeTextSecondary)
             }
             Spacer(minLength: 4)
             VStack(spacing: 2) {

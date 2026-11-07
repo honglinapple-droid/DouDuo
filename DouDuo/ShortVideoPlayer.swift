@@ -79,12 +79,13 @@ extension PlayerPage {
                          preparedPlayer: (() -> AVPlayer?)? = nil,
                          parkPlayer: ((String, AVPlayer) -> Void)? = nil,
                          onRateBoost: ((Bool) -> Void)? = nil,
+                         onEdgeBack: (() -> Void)? = nil,
                          onEnded: (() -> Void)?, onDoubleTap: (() -> Void)?,
                          onSavePosition: @escaping (Double) -> Void, onClose: @escaping () -> Void,
                          fillWidth: Bool = true, danmaku: [DYDanmaku] = []) -> PlayerPage {
         PlayerPage(id: id, url: url, knownDuration: durationSec, isActive: isActive, bottomInset: bottomInset,
                    resumePosition: resumePosition, preparedPlayer: preparedPlayer, parkPlayer: parkPlayer,
-                   onRateBoost: onRateBoost, onEnded: onEnded,
+                   onRateBoost: onRateBoost, onEdgeBack: onEdgeBack, onEnded: onEnded,
                    onDoubleTap: onDoubleTap, onSavePosition: onSavePosition, fillWidth: fillWidth,
                    topInset: topInset, danmaku: danmaku)
     }
@@ -107,6 +108,8 @@ struct PlayerPage: View {
     var parkPlayer: ((String, AVPlayer) -> Void)? = nil
     /// 2 倍速进 / 出的通知：外层据此把文案、按钮、顶栏藏起来（沉浸），松手恢复
     var onRateBoost: ((Bool) -> Void)? = nil
+    /// 视频区左缘右滑（系统级边缘手势，不和快进冲突）：外层用来收起分屏评论
+    var onEdgeBack: (() -> Void)? = nil
     let onEnded: (() -> Void)?
     let onDoubleTap: (() -> Void)?
     let onSavePosition: (Double) -> Void
@@ -276,6 +279,7 @@ struct PlayerPage: View {
                     #endif
                 if seeking { seekTo(seekPreview); seeking = false; previewImage = nil }
             },
+            onEdgeEnded: { dx, vx, w in if dx > max(80, w * 0.2) || vx > 600 { onEdgeBack?() } },
             verticalFirst: true
         )
     }

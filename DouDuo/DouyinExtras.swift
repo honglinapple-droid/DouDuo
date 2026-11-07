@@ -731,7 +731,7 @@ struct DYSearchScreen: View {
     private var history: [String] { historyRaw.split(separator: "\n").map(String.init) }
 
     var body: some View {
-        screenBody.edgeSwipeBack { dismiss() }
+        screenBody.swipeBack { dismiss() }
     }
 
     private var screenBody: some View {
@@ -739,7 +739,9 @@ struct DYSearchScreen: View {
             HStack(spacing: 10) {
                 Button { dismiss() } label: {
                     Image(systemName: "chevron.left").font(.headline.weight(.semibold)).foregroundStyle(.white)
+                        .frame(width: 44, height: 44).contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
                 .accessibilityIdentifier("douyin.search.back")
                 HStack(spacing: 6) {
                     Image(systemName: "magnifyingglass").foregroundStyle(.white.opacity(0.6))
@@ -901,7 +903,7 @@ struct DYMineScreen: View {
     @State private var open: DYListTarget?
 
     var body: some View {
-        screenBody.edgeSwipeBack { dismiss() }
+        screenBody.swipeBack { dismiss() }
     }
 
     private var screenBody: some View {
@@ -909,8 +911,9 @@ struct DYMineScreen: View {
             HStack {
                 Button { dismiss() } label: {
                     Image(systemName: "chevron.left").font(.headline.weight(.semibold)).foregroundStyle(.white)
-                        .frame(width: 40, height: 40)
+                        .frame(width: 44, height: 44).contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
                 .accessibilityIdentifier("douyin.mine.back")
                 Spacer()
                 Button("网页版 / 登录", systemImage: "safari") { onLogin() }
@@ -1029,7 +1032,7 @@ struct DYAuthorScreen: View {
     @State private var err: String?
 
     var body: some View {
-        screenBody.edgeSwipeBack { dismiss() }
+        screenBody.swipeBack { dismiss() }
     }
 
     private var screenBody: some View {
@@ -1037,8 +1040,9 @@ struct DYAuthorScreen: View {
             HStack {
                 Button { dismiss() } label: {
                     Image(systemName: "chevron.left").font(.headline.weight(.semibold)).foregroundStyle(.white)
-                        .frame(width: 40, height: 40)
+                        .frame(width: 44, height: 44).contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
                 .accessibilityIdentifier("douyin.author.back")
                 Spacer()
             }
@@ -1087,6 +1091,8 @@ struct DYFollowFeed: View {
     var onShare: ((DYAweme) -> Void)? = nil
     /// 长按 2 倍速进 / 出（外层藏顶栏）
     var onBoost: ((Bool) -> Void)? = nil
+    /// 分屏评论面板开 / 关：报给外层面板宽度（0 = 关），顶栏右侧按钮据此让位，不和叉号重叠
+    var onCommentsPanel: ((CGFloat) -> Void)? = nil
     @StateObject private var model: DYPagedModelHolder = DYPagedModelHolder()
     @State private var currentID: String?
     @State private var preloader = DYPreloader()
@@ -1132,7 +1138,8 @@ struct DYFollowFeed: View {
                                         preloader: preloader, bridge: bridge, onToast: onToast,
                                         followed: true,
                                         onShare: onShare.map { f in { f(item) } },
-                                        onBoost: onBoost)
+                                        onBoost: onBoost,
+                                        onEdgeBack: { if showComments { withAnimation(.snappy) { showComments = false } } })
                                 .containerRelativeFrame([.horizontal, .vertical])
                                 .id(item.id)
                         }
@@ -1158,6 +1165,8 @@ struct DYFollowFeed: View {
                     .presentationDetents([.fraction(0.62), .large])
             }
         }
+        .onChange(of: showComments) { _, open in onCommentsPanel?(open && wide ? min(380, geo.size.width * 0.36) : 0) }
+        .onChange(of: wide) { _, w in onCommentsPanel?(showComments && w ? min(380, geo.size.width * 0.36) : 0) }
         }
         .task {
             if m.items.isEmpty { await m.loadMore() }
