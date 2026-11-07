@@ -1,0 +1,97 @@
+name: Duo simulator screenshots
+
+on:
+  workflow_dispatch:
+    inputs:
+      src_ref:
+        description: "可选：用另一个 commit 的 DouDuo/ 源码来编（做对照）"
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  shots:
+    runs-on: xcode-27
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Overlay sources from src_ref (optional)
+        if: ${{ inputs.src_ref != '' }}
+        run: |
+          git checkout "${{ inputs.src_ref }}" -- DouDuo/ project.yml
+          git log -1 --oneline "${{ inputs.src_ref }}"
+      - name: Prepare tools and test videos
+        run: |
+          xcodebuild -version
+          brew install xcodegen ffmpeg
+          sh scripts/fetch-vlckit.sh
+          xcodegen generate
+          mkdir -p out media
+          # 竖屏 720x1280 测试片：上下左右写字，一眼看出裁了哪边
+          ffmpeg -loglevel error -f lavfi -i "color=c=0x224466:s=720x1280:d=30:r=30" \
+            -vf "drawgrid=w=90:h=90:c=white@0.25,drawtext=text='TOP':fontsize=72:fontcolor=white:x=(w-tw)/2:y=20,drawtext=text='BOTTOM':fontsize=72:fontcolor=white:x=(w-tw)/2:y=h-th-20,drawtext=text='L':fontsize=72:fontcolor=white:x=20:y=(h-th)/2,drawtext=text='R':fontsize=72:fontcolor=white:x=w-tw-20:y=(h-th)/2,drawtext=text='9x16':fontsize=96:fontcolor=yellow:x=(w-tw)/2:y=(h-th)/2" \
+            -c:v libx264 -pix_fmt yuv420p -movflags +faststart media/narrow.mp4
+          ffmpeg -loglevel error -f lavfi -i "color=c=0x664422:s=1280x720:d=30:r=30" \
+            -vf "drawgrid=w=90:h=90:c=white@0.25,drawtext=text='TOP':fontsize=72:fontcolor=white:x=(w-tw)/2:y=20,drawtext=text='BOTTOM':fontsize=72:fontcolor=white:x=(w-tw)/2:y=h-th-20,drawtext=text='16x9':fontsize=96:fontcolor=yellow:x=(w-tw)/2:y=(h-th)/2" \
+            -c:v libx264 -pix_fmt yuv420p -movflags +faststart media/wide.mp4
+          ls -la media
+      - name: Build Debug for simulator
+        run: |
+          set -o pipefail
+          xcodebuild -project DouDuo.xcodeproj -scheme DouDuo -configuration Debug -sdk iphonesimulator \
+            -destination 'generic/platform=iOS Simulator' -derivedDataPath build/DD build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO | tee out/build.log | tail -40
+          ls build/DD/Build/Products/Debug-iphonesimulator/
+      - name: Boot iPhone Duo, install, screenshot
+        run: |
+          set +e
+          UDID=$(xcrun simctl list devices available -j | python3 -c '
+          import json,sys
+          d=json.load(sys.stdin)["devices"]
+          for rt,devs in d.items():
+              for x in devs:
+                  if x["name"]=="iPhone Duo": print(x["udid"]); sys.exit()
+          ')
+          echo "udid=$UDID" | tee out/udid.txt
+          xcrun simctl boot "$UDID"; xcrun simctl bootstatus "$UDID" -b; sleep 20
+          echo "=== simctl ui help ===" | tee out/simctl-help.txt
+          xcrun simctl ui "$UDID" 2>&1 | tee -a out/simctl-help.txt
+          xcrun simctl help 2>&1 | tee out/simctl-all-help.txt >/dev/null
+          echo "=== io help ===" | tee -a out/simctl-help.txt; xcrun simctl io "$UDID" 2>&1 | head -60 | tee -a out/simctl-help.txt
+          shot() { for d in 1 3; do xcrun simctl io "$UDID" screenshot --display=$d "out/$1-display$d.png" 2>&1 | grep -v "Detected file type"; done; }
+          shot 00-home
+          APP=build/DD/Build/Products/Debug-iphonesimulator/DouDuo.app
+          xcrun simctl install "$UDID" "$APP"
+          BID=me.rrmm.douduo
+          echo "--- 正常启动（推荐流，不登录）"
+          xcrun simctl launch "$UDID" $BID; sleep 40
+          shot 10-feed
+          echo "--- 本地竖屏片"
+          xcrun simctl terminate "$UDID" $BID
+          SIMCTL_CHILD_DOUDUO_LOCALVIDEO="$PWD/media/narrow.mp4" xcrun simctl launch "$UDID" $BID; sleep 12
+          shot 20-local-narrow
+          echo "--- 本地横屏片"
+          xcrun simctl terminate "$UDID" $BID
+          SIMCTL_CHILD_DOUDUO_LOCALVIDEO="$PWD/media/wide.mp4" xcrun simctl launch "$UDID" $BID; sleep 12
+          shot 30-local-wide
+          echo "--- 尝试横屏（AppleScript 驱动 Simulator 菜单）"
+          open -a Simulator --args -CurrentDeviceUDID "$UDID"; sleep 8
+          osascript -e 'tell application "Simulator" to activate' -e 'tell application "System Events" to tell process "Simulator" to click menu item "Rotate Left" of menu "Device" of menu bar 1' 2>&1 | tee -a out/rotate.txt
+          sleep 6; shot 31-local-wide-rotated
+          osascript -e 'tell application "System Events" to tell process "Simulator" to click menu item "Rotate Right" of menu "Device" of menu bar 1' 2>&1 | tee -a out/rotate.txt
+          echo "--- 折叠/展开相关菜单项"
+          osascript -e 'tell application "System Events" to tell process "Simulator" to get name of every menu item of menu "Device" of menu bar 1' 2>&1 | tee out/device-menu.txt
+          C=$(xcrun simctl get_app_container "$UDID" $BID data 2>/dev/null); cp "$C/Documents/ddlog.txt" out/ddlog.txt 2>/dev/null
+          sips -g pixelWidth -g pixelHeight out/*.png | tee out/png-sizes.txt
+          xcrun simctl terminate "$UDID" $BID; xcrun simctl shutdown "$UDID"
+          exit 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: duo-shots-${{ inputs.src_ref || 'branch' }}
+          path: out
+          retention-days: 14
