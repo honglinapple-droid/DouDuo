@@ -1151,7 +1151,8 @@ struct DouyinFeedScreen: View {
         .sheet(item: $shareTarget) { a in
             DYFriendPicker(im: im, title: "发送给朋友") { friend in
                 showToast("发送中…")
-                Task { if await im.sendTo(friend, text: a.webURL.absoluteString) { showToast("已发给 \(friend.name)") } else { showToast(im.lastSendError ?? "没发出去") } }
+                // 走网页视频弹窗的「分享给朋友」，发出去的是视频卡片，不是链接
+                Task { if await im.shareVideo(a.id, to: friend) { showToast("已分享给 \(friend.name)") } else { showToast(im.lastSendError ?? "没发出去") } }
             }
             .presentationDetents([.medium, .large])
             .presentationBackground(Color(red: 0.12, green: 0.12, blue: 0.13))

@@ -243,19 +243,34 @@ private enum DYIMJS {
     return JSON.stringify({ ok: true, n: boxesNewestFirst().length, grew: boxesNewestFirst().length > n0 });
     """#
 
-    /// 双击朋友分享的视频卡片 = 点赞（网页会出现「你赞了对方分享的视频」）
-    static let likeCard = menuHelpers + #"""
-    const b = boxAt(box);
-    if (!b) return JSON.stringify({ ok: false, why: 'no-box' });
-    const c = b.querySelector('.MessageItemShareAwemecontainer') || b.querySelector('.BulletBulletVideocontainer') || b.querySelector('.messageMessageBoxcontentBox') || b;
-    const before = boxesNewestFirst().filter(x => /你赞了/.test(x.innerText)).length;
-    const r = c.getBoundingClientRect(); const o = { bubbles: true, cancelable: true, clientX: r.x + r.width / 2, clientY: r.y + r.height / 2, button: 0, pointerId: 1, isPrimary: true };
-    for (let k = 0; k < 2; k++) { for (const t of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) c.dispatchEvent(new (t.startsWith('pointer') ? PointerEvent : MouseEvent)(t, Object.assign({}, o, { detail: k + 1 }))); }
-    c.dispatchEvent(new MouseEvent('dblclick', Object.assign({}, o, { detail: 2 })));
-    let liked = false;
-    for (let i = 0; i < 12; i++) { await sleep(150); if (boxesNewestFirst().filter(x => /你赞了/.test(x.innerText)).length > before) { liked = true; break; } }
-    closeModal();
-    return JSON.stringify({ ok: liked });
+
+    /// 把一个视频（按 id）以卡片形式分享给朋友：后台网页不刷新地打开视频弹窗 → 分享面板 → 点那个人旁边的「分享」
+    static let shareVideo = helpers + #"""
+    const hov = el => { const r = el.getBoundingClientRect(); for (const t of ['pointerover', 'pointerenter', 'mouseover', 'mouseenter', 'mousemove']) el.dispatchEvent(new (t.startsWith('pointer') ? PointerEvent : MouseEvent)(t, { bubbles: true, clientX: r.x + r.width / 2, clientY: r.y + r.height / 2, pointerId: 1 })); };
+    const panelBtns = () => [...document.querySelectorAll('*')].filter(x => x.childElementCount <= 1 && txt(x) === '分享' && x.getBoundingClientRect().width > 0 && x.getBoundingClientRect().width < 120 && !x.closest('.imContainer'));
+    const closeAll = async () => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); await sleep(250); if (/modal_id=/.test(location.href)) history.back(); await sleep(400); };
+    if (!location.href.includes('modal_id=' + id)) {
+      if (/modal_id=/.test(location.href)) { history.back(); await sleep(500); }
+      history.pushState({}, '', '/jingxuan?modal_id=' + id); window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
+    }
+    let share = null;
+    for (let i = 0; i < 30; i++) { await sleep(200); share = document.querySelector('[data-e2e=video-player-share]'); if (share && share.getBoundingClientRect().width > 0) break; }
+    document.querySelectorAll('video').forEach(v => { try { v.pause(); } catch (e) {} });
+    if (!share) { await closeAll(); return JSON.stringify({ ok: false, why: 'no-modal' }); }
+    let e = share;
+    for (let i = 0; i < 5 && e && !panelBtns().length; i++) { hov(e); await sleep(400); e = e.parentElement; }
+    if (!panelBtns().length) { e = share; for (let i = 0; i < 5 && e && !panelBtns().length; i++) { fire(e); await sleep(500); e = e.parentElement; } }
+    if (!panelBtns().length) { await closeAll(); return JSON.stringify({ ok: false, why: 'no-panel' }); }
+    const rows = panelBtns().map(b => { let row = b; for (let i = 0; i < 6 && row && !row.querySelector('img'); i++) row = row.parentElement; return { b, row, t: txt(row) }; });
+    const hit = rows.find(x => x.t.split('\n')[0].trim() === name) || rows.find(x => x.t.startsWith(name));
+    if (!hit) { await closeAll(); return JSON.stringify({ ok: false, why: 'no-friend', n: rows.length }); }
+    const label0 = txt(hit.b);
+    fire(hit.b);
+    let changed = false;
+    for (let k = 0; k < 15; k++) { await sleep(150); const t1 = document.body.contains(hit.b) ? txt(hit.b) : ''; if (t1 !== label0) { changed = true; break; } }
+    await sleep(400);
+    await closeAll();
+    return JSON.stringify({ ok: true, changed });
     """#
 
     /// 取消回复
@@ -530,14 +545,6 @@ final class DYIMModel: ObservableObject {
         return true
     }
 
-    /// 双击卡片点赞。先走网页（对方会收到「赞了你分享的视频」），不行就直接给视频点赞（对方收不到通知）
-    func likeCard(_ m: DYIMMessage) async -> String {
-        if let r = try? await web.eval(DYIMJS.likeCard, ["box": m.box], as: ActionResp.self), r.ok { await refreshMessages(); return "已点赞" }
-        if let id = m.itemId, let bridge, let r = try? await bridge.digg(id, like: true) {
-            switch r { case .ok: return "已给视频点赞（对方不会收到通知）"; case .notLoggedIn: return "抖音未登录"; case .failed(let w): return "点赞失败：\(w)" }
-        }
-        return "点赞失败"
-    }
 
     func send(_ text: String) async -> Bool {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -618,6 +625,22 @@ final class DYIMModel: ObservableObject {
             guard r.ok, let id = r.id, !id.isEmpty else { return nil }
             return await detail(id)
         } catch { return nil }
+    }
+
+    /// 视频页「分享」：把视频以卡片形式发给朋友（走网页视频弹窗的分享面板）
+    func shareVideo(_ id: String, to c: DYIMConversation) async -> Bool {
+        lastSendError = nil
+        guard loggedIn else { lastSendError = "抖音未登录"; return false }
+        guard let r = try? await web.eval(DYIMJS.shareVideo, ["id": id, "name": c.name], as: ActionResp.self) else { lastSendError = "网页没响应，等几秒再试"; return false }
+        if !r.ok {
+            switch r.why ?? "" {
+            case "no-friend": lastSendError = "\(c.name) 不在网页的最近分享列表里，先在消息里给他发一条再分享"
+            case "no-panel": lastSendError = "网页分享面板没打开，再试一次"
+            case "no-modal": lastSendError = "网页没打开这个视频，再试一次"
+            default: lastSendError = "没发出去"
+            }
+        }
+        return r.ok
     }
 
     /// 把这条消息（视频）转发给朋友：走网页自己的「分享 → 选择朋友 → 发送」
@@ -771,7 +794,7 @@ struct DYChatScreen: View {
     @State private var forwardMessage: DYIMMessage?
     @State private var loadingOlder = false
     @State private var olderExhausted = false
-    @State private var heartFor: Int?
+
     @FocusState private var focused: Bool
 
     var body: some View {
@@ -907,11 +930,7 @@ struct DYChatScreen: View {
         }
     }
 
-    private func likeCard(_ m: DYIMMessage) {
-        heartFor = m.id
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { if heartFor == m.id { heartFor = nil } }
-        Task { show(await im.likeCard(m)) }
-    }
+
 
     private func longPress(_ m: DYIMMessage) {
         guard m.kind != .time else { return }
@@ -962,8 +981,7 @@ struct DYChatScreen: View {
                     CachedAsyncImage(url: m.cover.flatMap(URL.init(string:))) { img in img.resizable().scaledToFill() } placeholder: { dyBubble }
                         .frame(width: 150, height: 200).clipped()
                         .overlay {
-                            if heartFor == m.id { Image(systemName: "heart.fill").font(.system(size: 56)).foregroundStyle(dyRed).transition(.scale) }
-                            else if opening == m.id { ProgressView().tint(.white) }
+                            if opening == m.id { ProgressView().tint(.white) }
                             else { Image(systemName: "play.fill").font(.title).foregroundStyle(.white.opacity(0.85)) }
                         }
                     if let a = m.author, !a.isEmpty {
@@ -974,8 +992,6 @@ struct DYChatScreen: View {
                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             }
             .buttonStyle(.plain)
-            // 双击 = 点赞（抖音同款），单击才进视频
-            .highPriorityGesture(TapGesture(count: 2).onEnded { likeCard(m) })
         case .audio:
             HStack(spacing: 8) {
                 Image(systemName: "waveform").foregroundStyle(.white)
