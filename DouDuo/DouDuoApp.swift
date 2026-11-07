@@ -124,7 +124,9 @@ enum LocalVideoLaunch {
     static var target: (url: URL, fill: Bool)? {
         let env = ProcessInfo.processInfo.environment
         guard let p = env["DOUDUO_LOCALVIDEO"] else { return nil }
-        let url = p.hasPrefix("/") ? URL(fileURLWithPath: p)
+        // 绝对路径 / http 地址（云端内测用本机小服务器喂片） / Documents 里的文件名
+        let url = p.hasPrefix("http") ? (URL(string: p) ?? URL(fileURLWithPath: p))
+            : p.hasPrefix("/") ? URL(fileURLWithPath: p)
             : FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent(p)
         return (url, env["DOUDUO_LOCALFIT"] != "0")
     }
