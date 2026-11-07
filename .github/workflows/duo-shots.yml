@@ -31,13 +31,13 @@ jobs:
           sh scripts/fetch-vlckit.sh
           xcodegen generate
           mkdir -p out media
-          # 竖屏 720x1280 测试片：上下左右写字，一眼看出裁了哪边
-          ffmpeg -loglevel error -f lavfi -i "color=c=0x224466:s=720x1280:d=30:r=30" \
-            -vf "drawgrid=w=90:h=90:c=white@0.25,drawtext=text='TOP':fontsize=72:fontcolor=white:x=(w-tw)/2:y=20,drawtext=text='BOTTOM':fontsize=72:fontcolor=white:x=(w-tw)/2:y=h-th-20,drawtext=text='L':fontsize=72:fontcolor=white:x=20:y=(h-th)/2,drawtext=text='R':fontsize=72:fontcolor=white:x=w-tw-20:y=(h-th)/2,drawtext=text='9x16':fontsize=96:fontcolor=yellow:x=(w-tw)/2:y=(h-th)/2" \
-            -c:v libx264 -pix_fmt yuv420p -movflags +faststart media/narrow.mp4
-          ffmpeg -loglevel error -f lavfi -i "color=c=0x664422:s=1280x720:d=30:r=30" \
-            -vf "drawgrid=w=90:h=90:c=white@0.25,drawtext=text='TOP':fontsize=72:fontcolor=white:x=(w-tw)/2:y=20,drawtext=text='BOTTOM':fontsize=72:fontcolor=white:x=(w-tw)/2:y=h-th-20,drawtext=text='16x9':fontsize=96:fontcolor=yellow:x=(w-tw)/2:y=(h-th)/2" \
-            -c:v libx264 -pix_fmt yuv420p -movflags +faststart media/wide.mp4
+          # 测试片不用文字（云端 ffmpeg 没有 drawtext）：四边各一条色带 + 中间十字，裁掉哪边一眼可见
+          # 上=红 下=绿 左=蓝 右=黄
+          mk() { ffmpeg -loglevel error -f lavfi -i "color=c=0x333333:s=$1:d=30:r=30" \
+            -vf "drawgrid=w=80:h=80:c=white@0.2,drawbox=x=0:y=0:w=iw:h=60:c=red@0.9:t=fill,drawbox=x=0:y=ih-60:w=iw:h=60:c=green@0.9:t=fill,drawbox=x=0:y=0:w=60:h=ih:c=blue@0.9:t=fill,drawbox=x=iw-60:y=0:w=60:h=ih:c=yellow@0.9:t=fill,drawbox=x=iw/2-6:y=0:w=12:h=ih:c=white@0.8:t=fill,drawbox=x=0:y=ih/2-6:w=iw:h=12:c=white@0.8:t=fill" \
+            -c:v libx264 -pix_fmt yuv420p -movflags +faststart "$2"; }
+          mk 720x1280 media/narrow.mp4
+          mk 1280x720 media/wide.mp4
           ls -la media
       - name: Build Debug for simulator
         run: |
