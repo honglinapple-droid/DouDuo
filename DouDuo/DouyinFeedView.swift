@@ -702,7 +702,10 @@ struct DouyinFeedScreen: View {
 
     var body: some View {
         GeometryReader { geo in
-            let wide = geo.size.width >= 700
+            // 左右分屏（左视频右评论）的判定。原来是 宽 >= 700，iPhone Duo 内屏竖着是 669pt 宽，刚好不够，
+            // 所以内屏竖屏点评论还是从底部弹出，转成横屏（951 宽）才分屏。改成「短边 >= 600」：
+            // Duo 内屏横竖都分屏（669×951），外屏（466×678）横竖都用底部弹出，iPad 也分屏。
+            let wide = min(geo.size.width, geo.size.height) >= 600
             HStack(spacing: 0) {
                 feedArea
                 // 横屏 / 内屏默认整屏播放；点评论按钮才从右侧滑出评论栏，再点或点 × 收起
@@ -1958,8 +1961,13 @@ struct DYCommentPanel: View {
                 Text(total > 0 ? "\(DYFormat.count(total)) 条评论" : "评论").font(.subheadline.weight(.semibold))
                 Spacer()
                 if let onClose {
-                    Button(action: onClose) { Image(systemName: "xmark").font(.subheadline.weight(.semibold)) }
-                        .buttonStyle(.plain)
+                    // 关闭按钮原来只有图标那么大（约 14pt），很难点中；扩成 44×44 的可点区域
+                    Button(action: onClose) {
+                        Image(systemName: "xmark").font(.subheadline.weight(.semibold))
+                            .frame(width: 44, height: 44).contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("关闭评论")
                 }
             }
             .foregroundStyle(.themeTextPrimary)
