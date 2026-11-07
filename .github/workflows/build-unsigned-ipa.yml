@@ -1,0 +1,56 @@
+name: Build unsigned IPA
+
+on:
+  push:
+    branches: [bottom-align-latest]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Prepare build tools
+        run: |
+          xcodebuild -version
+          brew install xcodegen
+          sh scripts/fetch-vlckit.sh
+          xcodegen generate
+      - name: Build without signing
+        run: |
+          set -o pipefail
+          xcodebuild -project DouDuo.xcodeproj -scheme DouDuo \
+            -configuration Release -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            | tee build.log | tail -200
+      - name: Package IPA
+        run: |
+          mkdir -p build/package/Payload
+          cp -R build/DerivedData/Build/Products/Release-iphoneos/DouDuo.app build/package/Payload/
+          cd build/package
+          zip -qry ../DouDuo-bottom-align-unsigned.ipa Payload
+          cd ..
+          shasum -a 256 DouDuo-bottom-align-unsigned.ipa > SHA256SUMS.txt
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: DouDuo-bottom-align-unsigned
+          path: |
+            build/DouDuo-bottom-align-unsigned.ipa
+            build/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+          retention-days: 14
