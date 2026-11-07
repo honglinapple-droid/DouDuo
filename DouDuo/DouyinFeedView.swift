@@ -246,7 +246,7 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
 
     /// 关注 / 取关作者：网页版同一个接口（commit/follow/user）
     func follow(_ secUid: String, follow: Bool) async throws -> DYActionResult {
-        let d = try await call(Self.followJS, args: ["sec": secUid, "type": follow ? "1" : "0"], attempts: 2)
+        let d = try await call(Self.followUserJS, args: ["sec": secUid, "type": follow ? "1" : "0"], attempts: 2)
         let r = try JSONDecoder().decode(DYActionResp.self, from: d)
         return Self.interpret(r)
     }
@@ -427,7 +427,7 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
     return JSON.stringify({ status: r.s, statusCode: d.status_code, msg: d.status_msg || (r.s === 200 ? '' : (r.t || '').slice(0, 120)) });
     """#
 
-    private static let followJS = #"""
+    private static let followUserJS = #"""
     const r = await req('POST', '/aweme/v1/web/commit/follow/user/?' + q({}),
       new URLSearchParams({ sec_user_id: sec, type: type, channel_id: '3', from: '1', from_pre: '-1' }).toString());
     const d = parse(r.t) || {};
