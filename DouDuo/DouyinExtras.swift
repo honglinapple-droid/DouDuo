@@ -1093,6 +1093,8 @@ struct DYFollowFeed: View {
     var onBoost: ((Bool) -> Void)? = nil
     /// 分屏评论面板开 / 关：报给外层面板宽度（0 = 关），顶栏右侧按钮据此让位，不和叉号重叠
     var onCommentsPanel: ((CGFloat) -> Void)? = nil
+    /// 铰链状态（外层传入）：半折叠时评论铺满折痕右边
+    var hinge: DYHinge = .none
     @StateObject private var model: DYPagedModelHolder = DYPagedModelHolder()
     @State private var currentID: String?
     @State private var preloader = DYPreloader()
@@ -1154,7 +1156,7 @@ struct DYFollowFeed: View {
         }
         if wide && showComments, let cur = m.items.first(where: { $0.id == currentID }) {
             DYCommentPanel(bridge: bridge, aweme: cur, onClose: { withAnimation(.snappy) { showComments = false } })
-                .frame(width: min(380, geo.size.width * 0.36))
+                .frame(width: geo.dyPanelWidth(hinge: hinge, commentsOpen: showComments))
                 .id(cur.id)
                 .transition(.move(edge: .trailing))
         }
@@ -1165,8 +1167,10 @@ struct DYFollowFeed: View {
                     .presentationDetents([.fraction(0.62), .large])
             }
         }
-        .onChange(of: showComments) { _, open in onCommentsPanel?(open && wide ? min(380, geo.size.width * 0.36) : 0) }
-        .onChange(of: wide) { _, w in onCommentsPanel?(showComments && w ? min(380, geo.size.width * 0.36) : 0) }
+        .onChange(of: showComments) { _, open in onCommentsPanel?(open && wide ? geo.dyPanelWidth(hinge: hinge, commentsOpen: true) : 0) }
+        .onChange(of: wide) { _, w in onCommentsPanel?(showComments && w ? geo.dyPanelWidth(hinge: hinge, commentsOpen: true) : 0) }
+        .onChange(of: hinge) { _, _ in onCommentsPanel?(showComments && wide ? geo.dyPanelWidth(hinge: hinge, commentsOpen: true) : 0) }
+        .animation(.spring(response: 0.45, dampingFraction: 0.85), value: hinge)
         }
         .task {
             if m.items.isEmpty { await m.loadMore() }

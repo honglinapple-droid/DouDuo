@@ -31,6 +31,11 @@ struct DYIMMessage: Identifiable, Equatable, Codable {
     let avatar: String?
     /// 分享的视频 id（有了就能直接播，不用去网页点）
     var itemId: String? = nil
+    /// 群聊里的发言人（单聊为空）
+    var sender: String? = nil
+    /// 表情回复：谁用哪个表情回了这条
+    var reactions: [Reaction]? = nil
+    struct Reaction: Equatable, Codable { let img: String; let name: String }
 }
 
 struct DYIMBanner: Identifiable, Equatable {
@@ -100,6 +105,19 @@ private enum DYIMJS {
     return JSON.stringify({ ok: true, title: txt(document.querySelector('.StackLayoutStackChatHeadertitle')) });
     """#
 
+    /// 诊断：把当前聊天列表的 DOM 结构摘出来（每个消息框的 class 链、子节点 class、文字、React 数据的键）
+    static let domProbe = helpers + #"""
+    const list = document.querySelector('.messageMessageListlist');
+    if (!list) return JSON.stringify({ ok: false, why: 'no-list', title: txt(document.querySelector('.StackLayoutStackChatHeadertitle')) });
+    const cls = e => (e.className || '').toString().split(' ').filter(Boolean).slice(0, 3).join('.');
+    const outline = (e, depth) => { if (!e || depth > 5) return null; const kids = [...e.children].slice(0, 8).map(k => outline(k, depth + 1)).filter(Boolean); return { c: cls(e), t: (e.children.length === 0 ? txt(e).slice(0, 30) : ''), k: kids.length ? kids : undefined }; };
+    const boxes = [...list.children].slice(0, 6);
+    const out = boxes.map(b => { const m = msgOf(b); return { c: cls(b), idx: idxOf(b), keys: m ? Object.keys(m).slice(0, 25) : null, type: m && (m.type || m.msgType || m.messageType), pc: m && m.parsedContent ? JSON.stringify(m.parsedContent).slice(0, 200) : null, ext: m && m.ext ? JSON.stringify(m.ext).slice(0, 160) : null, o: outline(b, 0) }; });
+    const classes = [...new Set([...list.querySelectorAll('*')].flatMap(e => (e.className || '').toString().split(' ')).filter(c => /emoji|Emoji|react|React|reply|Reply|quote|Quote|refer|Refer/.test(c)))].slice(0, 40);
+    const emojiEls = [...list.querySelectorAll('[class*=moji], [class*=eact]')].slice(0, 6).map(e => ({ c: (e.className||'').toString().slice(0, 80), t: txt(e).slice(0, 40), img: e.querySelector('img') ? (e.querySelector('img').src || '').slice(0, 80) : '' }));
+    return JSON.stringify({ ok: true, title: txt(document.querySelector('.StackLayoutStackChatHeadertitle')), n: list.children.length, boxCls: boxesNewestFirst().length, classes, emojiEls, out });
+    """#
+
     /// 当前会话的聊天记录（从上到下 = 从旧到新）
     static let messages = helpers + #"""
     const list = document.querySelector('.messageMessageListlist');
@@ -121,17 +139,25 @@ private enum DYIMJS {
       const pick = el => { const im = el && (el.querySelector('img.commonMyImageimgReal') || el.querySelector('img')); return im ? (im.currentSrc || im.src || '') : ''; };
       let kind = 'other', text = '', author = '', cover = '';
       let itemId = pc.itemId ? String(pc.itemId) : '';
-      if (t) { kind = 'text'; text = t.innerText; }
-      else if (sh) { kind = 'share'; author = txt(sh.querySelector('.MessageItemShareAwemeauthorName')) || pc.content_name || ''; cover = pick(sh) || (pc.cover_url && pc.cover_url.url_list && pc.cover_url.url_list[0]) || ''; text = (pc.content_title || '').slice(0, 60) || '分享了一个视频'; }
+      const mtype = pm ? (pm.type || pm.msgType || pm.messageType || 0) : 0;
+      const coverOf = o => (o && o.url_list && o.url_list[0]) || '';
+      // b47：先读 React 数据（群聊的 DOM 结构和单聊不一样，按 class 找正文会落空、气泡全白）；DOM 只做兜底
+      if (mtype === 7 && pc.text) { kind = 'text'; text = String(pc.text); if (pc.related_share_video && pc.related_share_video.itemId) itemId = String(pc.related_share_video.itemId); }
+      else if (mtype === 8 || sh) { kind = 'share'; author = (sh && txt(sh.querySelector('.MessageItemShareAwemeauthorName'))) || pc.content_name || ''; cover = (sh && pick(sh)) || coverOf(pc.cover_url) || coverOf(pc.content_thumb) || ''; text = (pc.content_title || '').slice(0, 60) || '分享了一个视频'; }
+      else if (mtype === 17 || au) { kind = 'audio'; text = (au && txt(au.querySelector('.MessageItemAudioduration'))) || (pc.duration ? Math.round(pc.duration / 1000) + '"' : '') || '语音'; }
+      else if (t) { kind = 'text'; text = t.innerText; }
       else if (vid) { kind = 'video'; cover = pick(vid); text = '视频'; }
-      else if (au) { kind = 'audio'; text = txt(au.querySelector('.MessageItemAudioduration')) || '语音'; }
       else if (cs) { kind = 'comment'; text = txt(cs).slice(0, 200); }
       else if (/暂不支持/.test(b.innerText)) { kind = 'unsupported'; text = '暂不支持的消息类型，请到抖音手机端查看'; }
       else { const raw = txt(b).replace(/^已读\s*/, ''); if (raw && !time) text = raw.slice(0, 200); }
+      // 群聊：发言人名在气泡上方的 titleWrapper 里
+      const sender = txt(b.querySelector('.MessageBoxMessageTitletitleWrapper')).slice(0, 30);
+      // 表情回复（抖音在气泡底下画一排：表情图 + 谁回的）
+      const reactions = [...b.querySelectorAll('.ContentBottomEmojiReplyemojiReplyPanelItem')].slice(0, 12).map(it => { const im = it.querySelector('img'); return { img: im ? (im.currentSrc || im.src || '') : '', name: txt(it.querySelector('.ContentBottomEmojiReplyname')).slice(0, 20) }; }).filter(r => r.img);
       const tt = time ? txt(time) : '';
       const key = 100000 - i;   // 让 id 随时间递增
-      if (tt) flat.push({ id: key * 2, box: i, kind: 'time', fromMe: false, text: tt, author: '', cover: '', avatar: '', itemId: '' });
-      if (text || cover) flat.push({ id: key * 2 + 1, box: i, kind, fromMe, text, author, cover, avatar: av ? (av.currentSrc || av.src || '') : '', itemId });
+      if (tt) flat.push({ id: key * 2, box: i, kind: 'time', fromMe: false, text: tt, author: '', cover: '', avatar: '', itemId: '', sender: '', reactions: [] });
+      if (text || cover) flat.push({ id: key * 2 + 1, box: i, kind, fromMe, text, author, cover, avatar: av ? (av.currentSrc || av.src || '') : '', itemId, sender, reactions });
     });
     return JSON.stringify({ title: txt(document.querySelector('.StackLayoutStackChatHeadertitle')), msgs: flat });
     """#
@@ -494,7 +520,7 @@ final class DYIMModel: ObservableObject {
     private struct ListResp: Decodable { let login: Bool; let list: [Row]
         struct Row: Decodable { let index: Int; let name: String; let last: String; let time: String; let pinned: Bool; let avatar: String; let unread: Int } }
     private struct MsgResp: Decodable { let title: String; let msgs: [Row]
-        struct Row: Decodable { let id: Int; let box: Int; let kind: String; let fromMe: Bool; let text: String; let author: String; let cover: String; let avatar: String; let itemId: String? } }
+        struct Row: Decodable { let id: Int; let box: Int; let kind: String; let fromMe: Bool; let text: String; let author: String; let cover: String; let avatar: String; let itemId: String?; let sender: String?; let reactions: [DYIMMessage.Reaction]? } }
     private struct OKResp: Decodable { let ok: Bool; let login: Bool?; let title: String?; let why: String?; let id: String? }
 
     func attach(_ b: DouyinBridge) { bridge = b }
@@ -568,6 +594,16 @@ final class DYIMModel: ObservableObject {
         }
     }
 
+    /// 诊断：打开某个会话后把 DOM 结构写进日志（DOUDUO_IMPROBE=会话名）
+    func probe(_ name: String) async {
+        guard await ensurePanel() else { DYLiveModel.log("DDIMPROBE no panel"); return }
+        let c = conversations.first(where: { $0.name == name })
+        _ = try? await web.eval(DYIMJS.open, ["name": name, "index": c?.index ?? -1], as: OKResp.self)
+        try? await Task.sleep(nanoseconds: 2_500_000_000)
+        let r = (try? await web.evalRaw(DYIMJS.domProbe)) ?? "nil"
+        DYLiveModel.log("DDIMPROBE \(name) \(r)")
+    }
+
     func open(_ c: DYIMConversation) {
         openName = c.name
         messages = DYIMCache.chat(c.name)      // 先把上次的记录亮出来
@@ -593,10 +629,14 @@ final class DYIMModel: ObservableObject {
         guard !sharing else { return }
         do {
             let r = try await web.eval(DYIMJS.messages, as: MsgResp.self)
-            guard let name = openName, r.title.isEmpty || r.title == name else { return }
+            // 群聊的网页标题带人数后缀「沪上抖音分情(7)」，去掉再比（b47 之前这里不相等就整页不更新 → 群聊全空）
+            let shown = r.title.replacingOccurrences(of: #"\(\d+\)\s*$"#, with: "", options: .regularExpression).trimmingCharacters(in: .whitespaces)
+            guard let name = openName, r.title.isEmpty || shown == name || r.title == name else { return }
             let fresh = r.msgs.map { DYIMMessage(id: $0.id, box: $0.box, kind: DYIMMessage.Kind(rawValue: $0.kind) ?? .other, fromMe: $0.fromMe, text: $0.text,
                                                  author: $0.author.isEmpty ? nil : $0.author, cover: $0.cover.isEmpty ? nil : $0.cover, avatar: $0.avatar.isEmpty ? nil : $0.avatar,
-                                                 itemId: ($0.itemId ?? "").isEmpty ? nil : $0.itemId) }
+                                                 itemId: ($0.itemId ?? "").isEmpty ? nil : $0.itemId,
+                                                 sender: ($0.sender ?? "").isEmpty ? nil : $0.sender,
+                                                 reactions: ($0.reactions ?? []).isEmpty ? nil : $0.reactions) }
             guard !fresh.isEmpty else { return }
             let stable = Self.stabilize(fresh)
             if let mine = stable.last(where: { $0.fromMe && $0.avatar != nil }) { myAvatar = mine.avatar }
@@ -611,7 +651,7 @@ final class DYIMModel: ObservableObject {
             let base = "\(m.kind.rawValue)|\(m.fromMe)|\(m.text)|\(m.cover ?? "")|\(m.itemId ?? "")"
             let n = seen[base, default: 0]; seen[base] = n + 1
             var h = Hasher(); h.combine(base); h.combine(n)
-            return DYIMMessage(id: h.finalize(), box: m.box, kind: m.kind, fromMe: m.fromMe, text: m.text, author: m.author, cover: m.cover, avatar: m.avatar, itemId: m.itemId)
+            return DYIMMessage(id: h.finalize(), box: m.box, kind: m.kind, fromMe: m.fromMe, text: m.text, author: m.author, cover: m.cover, avatar: m.avatar, itemId: m.itemId, sender: m.sender, reactions: m.reactions)
         }
     }
 
@@ -969,6 +1009,7 @@ struct DYChatScreen: View {
                     .foregroundStyle(.white)
                     .padding(.horizontal, 12).padding(.vertical, 8)
                     .background(RoundedRectangle(cornerRadius: 18).fill(.white.opacity(0.08)))
+                    .dyGlass(in: RoundedRectangle(cornerRadius: 18), interactive: false)
                 Button { Task { await doSend() } } label: {
                     if sending { ProgressView().tint(.white).frame(width: 60, height: 34) }
                     else { Text("发送").font(.subheadline.weight(.semibold)).foregroundStyle(.white).frame(width: 60, height: 34).background(Capsule().fill(draft.trimmingCharacters(in: .whitespaces).isEmpty ? Color.white.opacity(0.15) : dyRed)) }
@@ -1083,16 +1124,38 @@ struct DYChatScreen: View {
         default:
             HStack(alignment: .top, spacing: 8) {
                 if m.fromMe { Spacer(minLength: 50) } else { avatar(m.avatar ?? conversation.avatar, size: 36) }
-                if m.kind == .share || m.kind == .video {
-                    // 视频卡片：长按出菜单、点一下才打开——互斥，松手不会再把视频打开（b45 之前长按松手视频必弹）
-                    content(m)
-                        .contentShape(Rectangle())
-                        .gesture(LongPressGesture(minimumDuration: 0.4).onEnded { _ in longPress(m) }
-                            .exclusively(before: TapGesture().onEnded { openCard(m) }))
-                } else {
-                    content(m)
-                        .contentShape(Rectangle())
-                        .simultaneousGesture(LongPressGesture(minimumDuration: 0.4).onEnded { _ in longPress(m) })
+                VStack(alignment: m.fromMe ? .trailing : .leading, spacing: 4) {
+                    // 群聊：发言人名
+                    if let s = m.sender, !s.isEmpty, !m.fromMe {
+                        Text(s).font(.caption).foregroundStyle(.white.opacity(0.55)).padding(.horizontal, 4)
+                    }
+                    if m.kind == .share || m.kind == .video {
+                        // 视频卡片：长按出菜单、点一下才打开——互斥，松手不会再把视频打开（b45 之前长按松手视频必弹）
+                        content(m)
+                            .contentShape(Rectangle())
+                            .gesture(LongPressGesture(minimumDuration: 0.4).onEnded { _ in longPress(m) }
+                                .exclusively(before: TapGesture().onEnded { openCard(m) }))
+                    } else {
+                        content(m)
+                            .contentShape(Rectangle())
+                            .simultaneousGesture(LongPressGesture(minimumDuration: 0.4).onEnded { _ in longPress(m) })
+                    }
+                    // 表情回复：和抖音一样，气泡底下一排小表情 + 谁回的
+                    if let rs = m.reactions, !rs.isEmpty {
+                        HStack(spacing: 6) {
+                            ForEach(Array(rs.enumerated()), id: \.offset) { _, r in
+                                HStack(spacing: 3) {
+                                    CachedAsyncImage(url: URL(string: r.img)) { img in img.resizable().scaledToFit() } placeholder: { Color.clear }
+                                        .frame(width: 18, height: 18)
+                                    if !r.name.isEmpty { Text(r.name).font(.caption2).foregroundStyle(.white.opacity(0.75)).lineLimit(1) }
+                                }
+                                .padding(.horizontal, 8).padding(.vertical, 4)
+                                .background(Capsule().fill(.white.opacity(0.1)))
+                                .dyGlass()
+                            }
+                        }
+                        .padding(.horizontal, 2)
+                    }
                 }
                 if m.fromMe { avatar(m.avatar ?? im.myAvatar, size: 36) } else { Spacer(minLength: 50) }
             }

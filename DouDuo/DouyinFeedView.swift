@@ -864,6 +864,8 @@ struct DouyinFeedScreen: View {
     /// 当前条正在长按 2 倍速：顶栏跟着藏起来（沉浸）
     @State private var boosting = false
     @State private var followPanelInset: CGFloat = 0
+    /// 铰链状态（iPhone Duo）：半折叠且评论开着 → 视频占折痕左边、评论铺满折痕右边
+    @State private var hinge: DYHinge = .none
     @State private var saveTask: Task<Void, Never>?
     @State private var web: DYWebTarget?
     @State private var tab: DYTab = ProcessInfo.processInfo.environment["DOUDUO_STARTLIVE"] == "1" ? .live : .recommend
@@ -892,11 +894,13 @@ struct DouyinFeedScreen: View {
                 // 横屏 / 内屏默认整屏播放；点评论按钮才从右侧滑出评论栏，再点或点 × 收起
                 if wide && showComments && tab == .recommend, let cur = current {
                     DYCommentPanel(bridge: bridge, aweme: cur, onClose: { withAnimation(.snappy) { showComments = false } })
-                        .frame(width: min(380, geo.size.width * 0.36))
+                        .frame(width: geo.dyPanelWidth(hinge: hinge, commentsOpen: showComments))
                         .id(cur.id)
                         .transition(.move(edge: .trailing))
                 }
             }
+            .animation(.spring(response: 0.45, dampingFraction: 0.85), value: hinge)
+            .dyHinge($hinge)
             .background(theme.media.strongScrim.color(for: scheme).ignoresSafeArea())
             .onAppear { insets = geo.safeAreaInsets; narrow = geo.size.width < 520 }
             .onChange(of: geo.safeAreaInsets) { _, v in insets = v }
@@ -961,6 +965,10 @@ struct DouyinFeedScreen: View {
                 DispatchQueue.main.asyncAfter(deadline: .now() + sec) { tab = .live }
             }
             let env = ProcessInfo.processInfo.environment
+            if let n = env["DOUDUO_IMPROBE"] {
+                try? await Task.sleep(nanoseconds: 14_000_000_000)
+                await im.probe(n)
+            }
             if let o = env["DOUDUO_OPEN"] {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 switch o {
@@ -1203,7 +1211,8 @@ struct DouyinFeedScreen: View {
                              onToast: { showToast($0) },
                              onShare: { shareTarget = $0 },
                              onBoost: { boosting = $0 },
-                             onCommentsPanel: { followPanelInset = $0 })
+                             onCommentsPanel: { followPanelInset = $0 },
+                             hinge: hinge)
             } else {
                 recommendArea
             }
@@ -1272,7 +1281,7 @@ struct DouyinFeedScreen: View {
     /// 顶部一排：左菜单，中间 关注/推荐/直播，右边 搜索 / 我的
     private var topBar: some View {
         HStack(alignment: .center, spacing: 0) {
-            menuButton.frame(width: 40, height: 40)
+            menuButton.frame(width: 40, height: 40).dyGlass(in: Circle())
             Spacer(minLength: 4)
             tabSwitcher
             Spacer(minLength: 4)
@@ -1294,6 +1303,7 @@ struct DouyinFeedScreen: View {
                 .frame(width: 40, height: 40)
                 .contentShape(Rectangle())
                 .themeShadow(.mediaLabel)
+                .dyGlass(in: Circle())
         }
         .buttonStyle(.plain)
         .accessibilityIdentifier(id)
@@ -2267,6 +2277,8 @@ struct DYVideoPage: View {
         Button(action: act) {
             VStack(spacing: 3) {
                 Image(systemName: icon).font(.system(size: theme.typography.pointSize(.displayLarge))).foregroundStyle(tint)
+                    .frame(width: 48, height: 48)
+                    .dyGlass(in: Circle())
                 Text(text).font(.caption2.weight(.semibold)).foregroundStyle(theme.media.onMedia.color(for: scheme))
             }
         }
@@ -2328,11 +2340,30 @@ struct DYCommentPanel: View {
         self.bridge = bridge; self.aweme = aweme; self.onClose = onClose
     }
 
+    /// 跟手：面板随手指向右移动，松手超过面板宽 35% 或甩得够快就收起，否则弹回；向左一滑（>80pt）也收起
+    @State private var dragX: CGFloat = 0
     var body: some View {
-        // 面板内横向一滑（左右都行）就收起；之前只有最左 24pt 的边缘条
-        panelBody.simultaneousGesture(DragGesture(minimumDistance: 24).onEnded { v in
-            if abs(v.translation.width) > 80, abs(v.translation.height) < 70 { onClose?() }
-        })
+        GeometryReader { g in
+            panelBody
+                .offset(x: dragX)
+                .simultaneousGesture(DragGesture(minimumDistance: 18)
+                    .onChanged { v in
+                        guard abs(v.translation.width) > abs(v.translation.height) * 1.2 else { return }
+                        dragX = max(0, v.translation.width)
+                    }
+                    .onEnded { v in
+                        let w = max(g.size.width, 1)
+                        let fast = v.predictedEndTranslation.width - v.translation.width > 120
+                        if v.translation.width > w * 0.35 || (v.translation.width > 40 && fast) {
+                            onClose?()
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { dragX = 0 }
+                        } else if v.translation.width < -80, abs(v.translation.height) < 70 {
+                            onClose?()
+                        } else {
+                            withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { dragX = 0 }
+                        }
+                    })
+        }
     }
 
     private var panelBody: some View {
@@ -2344,6 +2375,8 @@ struct DYCommentPanel: View {
                     // 关闭按钮原来只有图标那么大（约 14pt），很难点中；扩成 44×44 的可点区域
                     Button(action: onClose) {
                         Image(systemName: "xmark").font(.headline.weight(.semibold))
+                            .frame(width: 36, height: 36).contentShape(Circle())
+                            .dyGlass(in: Circle())
                             .frame(width: 52, height: 44).contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
@@ -2398,6 +2431,7 @@ struct DYCommentPanel: View {
                     .focused($inputFocused)
                     .padding(.horizontal, 12).padding(.vertical, 8)
                     .background(Capsule().fill(Color.primary.opacity(0.08)))
+                    .dyGlass(interactive: false)
                     .accessibilityIdentifier("douyin.comment.input")
                 Button { Task { await send() } } label: {
                     if sending { ProgressView().controlSize(.small) }
