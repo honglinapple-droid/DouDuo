@@ -207,17 +207,19 @@ final class DYRecommender {
     }
 
     /// 后台补备用池：相关推荐（拿最近正向的种子问）+ 关注的人。不重试，拉不到就算；主线不等它
+    private var lastRefill: Date = .distantPast
     func refillPool(_ bridge: DouyinBridge, loggedIn: Bool) {
-        guard !refilling, pool.count < 8 else { return }
-        refilling = true
+        // 最多一分钟补一次，一次 2 个请求（相关推荐 1 + 关注 1），别和主线抢
+        guard !refilling, pool.count < 8, Date().timeIntervalSince(lastRefill) > 60 else { return }
+        refilling = true; lastRefill = Date()
         Task {
             defer { refilling = false }
             let p = DYTasteProfile.shared
-            let seeds = Array(p.positives.shuffled().prefix(2))
+            let seeds = Array(p.positives.shuffled().prefix(1))
             async let r1: [DYAweme] = seeds.indices.contains(0) ? ((try? await bridge.related(seeds[0])) ?? []) : []
-            async let r2: [DYAweme] = seeds.indices.contains(1) ? ((try? await bridge.related(seeds[1])) ?? []) : []
             async let f1: [DYAweme] = loggedIn ? ((try? await bridge.followFeed(cursor: followCursor))?.items ?? []) : []
-            let (a, b, f) = await (r1, r2, f1)
+            let (a, f) = await (r1, f1)
+            let b: [DYAweme] = []
             let blocked = DYTaste.blockedAuthors
             var have = Set(pool.map { $0.a.id })
             for (list, bonus) in [(a + b, 0.6), (f, 0.1)] {

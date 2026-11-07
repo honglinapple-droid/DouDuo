@@ -486,7 +486,7 @@ final class DYIMModel: ObservableObject {
                 await refreshList()
                 listLoading = false
                 // 列表页开着 3 秒一刷；聊天页开着 8 秒；都没开 15 秒（够弹横幅，又不拖慢视频）
-                let gap: UInt64 = listVisible ? 3 : (chatVisible ? 8 : 15)
+                let gap: UInt64 = listVisible ? 3 : (chatVisible ? 8 : 30)
                 try? await Task.sleep(nanoseconds: gap * 1_000_000_000)
             }
         }

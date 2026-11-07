@@ -747,23 +747,22 @@ final class DYFeedModel: ObservableObject {
         if localRec {
             // 本地推荐器：主线还是作者那套（一次一个网页流请求、来了就塞），只是每页回来先就地过滤排序，
             // 再从后台备用池插几条；备用池（相关推荐 / 关注）在后台补，主线不等它
-            let rounds: [Int] = portraitOnly ? [1, 2, 2] : [1, 1]
+            // 请求量和作者一样：一次 1 个，不够再补 1 个（之前一批最多 5 个，被抖音限流后列表就干了）
+            var raw: [DYAweme] = []
             do {
-                for n in rounds {
-                    let pages: [(items: [DYAweme], hasMore: Bool)] = try await withThrowingTaskGroup(of: (items: [DYAweme], hasMore: Bool).self) { g in
-                        for _ in 0..<n { g.addTask { try await bridge.fetchFeed() } }
-                        var out: [(items: [DYAweme], hasMore: Bool)] = []
-                        for try await r in g { out.append(r) }
-                        return out
-                    }
-                    for r in pages {
-                        let ranked = DYRecommender.shared.rank(r.items, portraitMode: portraitMode, followed: followed, exclude: Set(items.map(\.id)))
-                        added += absorb(ranked, hasMore: true, prefiltered: true)
-                    }
-                    if added >= want { break }
+                for _ in 0..<2 {
+                    let r = try await bridge.fetchFeed()
+                    raw += r.items
+                    let ranked = DYRecommender.shared.rank(r.items, portraitMode: portraitMode, followed: followed, exclude: Set(items.map(\.id)))
+                    added += absorb(ranked, hasMore: true, prefiltered: true)
+                    if added >= max(want, 3) { break }
                 }
             } catch {
                 if items.isEmpty { self.error = error.localizedDescription }
+            }
+            if added == 0 && !raw.isEmpty {
+                // 兜底：过滤后一条不剩（看过的太多 / 横屏太多）就放原始页，列表不能干
+                added += absorb(raw, hasMore: true, prefiltered: portraitMode == 0)
             }
             hasMore = true
             if items.isEmpty && added == 0 && error == nil { error = "暂时没刷到推荐，登录后或稍后再试" }
@@ -1120,18 +1119,18 @@ struct DouyinFeedScreen: View {
     }
 
     /// 看了一会儿之后，在后台悄悄把下一批拼好、第一条预加载好
-    /// 后台常备两批：第一条视频起来 1.5 秒后开始备，备到两批为止；换掉一批马上补
+    /// 后台常备一批（之前两批太费请求，被抖音限流）：第一条视频起来 1.5 秒后开始备；换掉马上补
     private func scheduleNextBatch() {
-        guard nextBatches.count < 2, !preparingNext else { return }
+        guard nextBatches.count < 1, !preparingNext else { return }
         preparingNext = true
         Task {
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             defer { preparingNext = false }
-            while nextBatches.count < 2 {
+            while nextBatches.count < 1 {
                 guard !refreshing, !feed.items.isEmpty else { break }
                 let m = DYFeedModel()
                 m.followed = feed.followed
-                await m.loadMore(bridge, want: 8)
+                await m.loadMore(bridge, want: 6)
                 let seen = Set(feed.items.map(\.id)).union(nextBatches.flatMap { $0.items.map(\.id) })
                 m.items.removeAll { seen.contains($0.id) }
                 guard !m.items.isEmpty else { break }
