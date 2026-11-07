@@ -631,7 +631,7 @@ final class DYFeedModel: ObservableObject {
     /// 电脑版推荐流给匿名用户大多是横屏长视频（实测竖屏只占一两成），默认只留竖屏 + 图集，
     /// 不够就连拉几页补齐；菜单里可关掉
     /// 默认关：网页版推荐约八成是横屏，只留竖屏会把很多对口味的视频滤掉（2026-11 老板拍板默认关）
-    @AppStorage("douyin_portrait_only_v2") var portraitOnly = false
+    @AppStorage("douyin_portrait_only_v3") var portraitOnly = true   // 用户要求默认开
     /// 视频比屏幕窄（左右黑边）时自动放大铺满宽度；菜单里可关
     @AppStorage("douyin_autofit_v1") var autoFit = true
 
@@ -675,6 +675,8 @@ struct DouyinFeedScreen: View {
     @StateObject private var bridge = DouyinBridge()
     @StateObject private var feed = DYFeedModel()
     @State private var insets = EdgeInsets()
+    /// 防误触：进度条贴底后，底边上滑第一下先给 App（拖进度条），连划两下才回桌面
+    @AppStorage("douyin_defer_bottom_gesture_v1") private var deferBottomGesture = true
     @State private var showScreenInfo = false
     @State private var screenInfo = ""
     @State private var preloader = DYPreloader()
@@ -693,7 +695,7 @@ struct DouyinFeedScreen: View {
     @State private var showSearch = false
     @State private var lastFeedPull = Date.distantPast
     @AppStorage(DYVideoCache.countKey) private var cacheCount = DYVideoCache.defaultCount
-    @AppStorage("douyin_danmaku_v1") private var danmakuOn = true
+    @AppStorage("douyin_danmaku_v2") private var danmakuOn = false
     @State private var showMine = false
     @State private var authorTarget: DYAweme.Author?
 
@@ -729,6 +731,7 @@ struct DouyinFeedScreen: View {
         }
         .background(DouyinBridgeHost(bridge: bridge).frame(width: 1, height: 1).allowsHitTesting(false))
         .statusBarHidden(true)
+        .defersSystemGestures(on: deferBottomGesture ? .bottom : [])
         .task {
             guard !initialized else { return }
             initialized = true
@@ -1213,7 +1216,8 @@ struct DouyinFeedScreen: View {
             .disabled(refreshing)
             Toggle(isOn: $feed.portraitOnly) { Label("只看竖屏", systemImage: "rectangle.portrait") }
             Toggle(isOn: $feed.autoFit) { Label("自动铺满宽度", systemImage: "arrow.up.left.and.arrow.down.right") }
-            Toggle(isOn: $danmakuOn) { Label("弹幕", systemImage: "text.bubble") }
+            // 弹幕开关已去掉（用户不要弹幕）
+            Toggle(isOn: $deferBottomGesture) { Label("防误触（底边上滑先拖进度条）", systemImage: "hand.raised") }
             Picker(selection: $cacheCount) {
                 Text("关闭").tag(0)
                 Text("20 条").tag(20)
@@ -1414,7 +1418,7 @@ private struct DYLiveFeed: View {
     @State private var liveSending = false
     @State private var liveErr: String?
     @FocusState private var liveFocused: Bool
-    @AppStorage("douyin_danmaku_v1") private var danmakuOn = true
+    @AppStorage("douyin_danmaku_v2") private var danmakuOn = false
     @State private var tick = 0      // 0.5s 刷新一次，让调试进度文案跟着走
     @State private var scrollID: String?
     @State private var userScrolling = false
@@ -1674,7 +1678,7 @@ struct DYVideoPage: View {
     @State private var danmakuSending = false
     @FocusState private var danmakuFocused: Bool
     @AppStorage("douyin_autofit_v1") private var autoFit = true
-    @AppStorage("douyin_danmaku_v1") private var danmakuOn = true
+    @AppStorage("douyin_danmaku_v2") private var danmakuOn = false
 
     init(item: DYAweme, isCurrent: Bool, insets: EdgeInsets, resume: Double?, liked: Bool, collected: Bool,
          onLike: @escaping () -> Void, onCollect: @escaping () -> Void, onDoubleTap: @escaping () -> Void,
@@ -1857,12 +1861,7 @@ struct DYVideoPage: View {
             action(liked ? "heart.fill" : "heart", DYFormat.count(item.stats.digg + (liked ? 1 : 0)),
                    tint: liked ? theme.status.danger.color(for: scheme) : fg, "douyin.like", onLike)
             action("ellipsis.message.fill", DYFormat.count(item.stats.comment), tint: fg, "douyin.comments", onComments)
-            if item.images.isEmpty, bridge != nil {
-                action("text.bubble", "弹幕", tint: fg, "douyin.danmaku.open") {
-                    showDanmakuInput = true
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { danmakuFocused = true }
-                }
-            }
+            // 弹幕按钮已按用户要求去掉（2026-11-07）
             action(collected ? "star.fill" : "star",
                    DYFormat.count(item.stats.collect + (collected ? 1 : 0)),
                    tint: collected ? theme.status.warning.color(for: scheme) : fg, "douyin.collect", onCollect)
@@ -1876,19 +1875,7 @@ struct DYVideoPage: View {
                 }
                 .foregroundStyle(fg)
             }
-            Button(action: save) {
-                VStack(spacing: 3) {
-                    if saving {
-                        ProgressView().tint(fg).frame(height: theme.typography.pointSize(.displayLarge))
-                    } else {
-                        Image(systemName: "arrow.down.to.line").font(.system(size: theme.typography.pointSize(.title)))
-                    }
-                    Text("保存").font(.caption2.weight(.semibold))
-                }
-                .foregroundStyle(fg)
-            }
-            .buttonStyle(.plain)
-            .accessibilityIdentifier("douyin.save")
+            // 保存按钮已按用户要求去掉（2026-11-07）
         }
         .themeShadow(.mediaLabel)
     }

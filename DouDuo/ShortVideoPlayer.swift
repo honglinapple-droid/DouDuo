@@ -135,6 +135,7 @@ struct PlayerPage: View {
     @State private var barWidth: CGFloat = 1
     @State private var vlc: VLCPlayerController?        // AVPlayer 起播失败 → VLC 软解兜底
     @State private var avRetried = false
+    @State private var loadFailed = false          // AVPlayer 和 VLC 都起不来，提示换下一条
     private let playbackID = UUID()
 
     var body: some View {
@@ -157,6 +158,16 @@ struct PlayerPage: View {
             if isActive && !isPlaying && (player != nil || vlc != nil) && !seeking {
                 Image(systemName: "play.fill").font(.system(size: 52)).foregroundStyle(.white.opacity(0.75))
                     .allowsHitTesting(false)
+            }
+            if loadFailed && isActive && current < 0.1 {
+                VStack(spacing: 8) {
+                    Image(systemName: "wifi.exclamationmark").font(.system(size: 34))
+                    Text("这条加载失败，上滑看下一条").font(.subheadline.weight(.semibold))
+                }
+                .foregroundStyle(.white.opacity(0.9))
+                .padding(.horizontal, 18).padding(.vertical, 14)
+                .background(RoundedRectangle(cornerRadius: 14, style: .continuous).fill(.black.opacity(0.55)))
+                .allowsHitTesting(false)
             }
             if rateBoost {
                 Label("2 倍速播放中", systemImage: "forward.fill")
@@ -362,9 +373,10 @@ struct PlayerPage: View {
         #endif
     }
 
-    /// 起播看门狗：当前屏 6 秒还没走（网络抖 / 预加载的 item 失效），重建播放项再来一次
+    /// 起播看门狗：当前屏 3 秒还没走（网络抖 / 预加载的 item 失效），重建播放项再来一次
+    /// （原来 6 秒，用户反馈黑屏等太久，改短：3 秒重建 → 再 3 秒切 VLC → 再 5 秒提示换下一条）
     private func watchdog(_ p: AVPlayer) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
             guard isActive, isPlaying, player === p, !seeking, vlc == nil else { return }
             let stuck = p.currentItem == nil || p.currentItem?.status == .failed || p.currentTime().seconds < 0.1
             guard stuck else { return }
@@ -373,6 +385,7 @@ struct PlayerPage: View {
     }
 
     private func rebuild() {
+        loadFailed = false
         teardownPlayerOnly()
         let item = AVPlayerItem(asset: DYMedia.asset(url))
         let p = AVPlayer(playerItem: item)
@@ -442,6 +455,12 @@ struct PlayerPage: View {
         }
         v.play(url: url, autoplay: isActive, headers: DYMedia.headers)
         vlc = v
+        loadFailed = false
+        // VLC 也起不来：别让用户干等，直接提示上滑换下一条
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak v] in
+            guard let v, isActive, vlc === v, v.current < 0.1 else { return }
+            loadFailed = true
+        }
         #if DEBUG
         ddWrite("DDVLC takeover \(id)")
         DispatchQueue.main.asyncAfter(deadline: .now() + 6) { ddWrite("DDVLC \(id) t=\(v.current) playing=\(v.isPlaying)") }
@@ -504,6 +523,7 @@ struct PlayerPage: View {
     }
 
     private func teardown() {
+        loadFailed = false
         if let v = vlc { onSavePosition(v.current); v.onEnd = nil; v.onProgress = nil; v.stop(); vlc = nil }
         if let p = player { onSavePosition(p.currentTime().seconds) }
         if let t = timeToken { player?.removeTimeObserver(t); timeToken = nil }
