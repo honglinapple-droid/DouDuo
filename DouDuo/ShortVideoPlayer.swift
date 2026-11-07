@@ -77,11 +77,12 @@ extension PlayerPage {
                          topInset: CGFloat, bottomInset: CGFloat, resumePosition: Double?,
                          compactChrome: Bool,
                          preparedPlayer: (() -> AVPlayer?)? = nil,
+                         parkPlayer: ((String, AVPlayer) -> Void)? = nil,
                          onEnded: (() -> Void)?, onDoubleTap: (() -> Void)?,
                          onSavePosition: @escaping (Double) -> Void, onClose: @escaping () -> Void,
                          fillWidth: Bool = true, danmaku: [DYDanmaku] = []) -> PlayerPage {
         PlayerPage(id: id, url: url, knownDuration: durationSec, isActive: isActive, bottomInset: bottomInset,
-                   resumePosition: resumePosition, preparedPlayer: preparedPlayer, onEnded: onEnded,
+                   resumePosition: resumePosition, preparedPlayer: preparedPlayer, parkPlayer: parkPlayer, onEnded: onEnded,
                    onDoubleTap: onDoubleTap, onSavePosition: onSavePosition, fillWidth: fillWidth,
                    topInset: topInset, danmaku: danmaku)
     }
@@ -100,6 +101,8 @@ struct PlayerPage: View {
     let bottomInset: CGFloat
     let resumePosition: Double?
     let preparedPlayer: (() -> AVPlayer?)?
+    /// 页面滑走时把播放器停放出去（不销毁），滑回来接着播。nil = 原来的销毁逻辑
+    var parkPlayer: ((String, AVPlayer) -> Void)? = nil
     let onEnded: (() -> Void)?
     let onDoubleTap: (() -> Void)?
     let onSavePosition: (Double) -> Void
@@ -346,7 +349,9 @@ struct PlayerPage: View {
         gen.requestedTimeToleranceAfter = CMTime(seconds: 1.5, preferredTimescale: 600)
         imgGen = gen
         attachObservers(p)
-        if let r = resumePosition, r > 1 { p.seek(to: CMTime(seconds: r, preferredTimescale: 600)) }
+        // 停放回来的播放器已经停在原进度上，不用再 seek（seek 会卡一下）
+        if let r = resumePosition, r > 1, abs(p.currentTime().seconds - r) > 1 { p.seek(to: CMTime(seconds: r, preferredTimescale: 600)) }
+        if pre != nil, p.currentTime().seconds > 0.5 { current = p.currentTime().seconds }
         p.isMuted = !isActive
         if isActive {
             try? AVAudioSession.sharedInstance().setCategory(.playback)
@@ -528,8 +533,14 @@ struct PlayerPage: View {
         if let p = player { onSavePosition(p.currentTime().seconds) }
         if let t = timeToken { player?.removeTimeObserver(t); timeToken = nil }
         if let o = endObserver { NotificationCenter.default.removeObserver(o); endObserver = nil }
-        player?.pause()
-        player?.replaceCurrentItem(with: nil)
+        if let p = player, let parkPlayer, p.currentItem != nil, p.currentItem?.status != .failed {
+            // 停放：留着已缓冲的数据和进度，滑回来秒开
+            p.pause()
+            parkPlayer(id, p)
+        } else {
+            player?.pause()
+            player?.replaceCurrentItem(with: nil)
+        }
         player = nil
         imgGen?.cancelAllCGImageGeneration(); imgGen = nil
         isPlaying = false

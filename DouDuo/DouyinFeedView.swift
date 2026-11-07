@@ -554,6 +554,8 @@ private struct DYPlayerLayerView: UIViewRepresentable {
 @MainActor
 final class DYPreloader {
     static let ahead = 3
+    /// 往回保留几条：页面滑出屏幕时播放器不销毁而是「停放」在这里（带着进度），滑回来直接接着播，不黑屏
+    static let behind = 2
     private var players: [String: AVPlayer] = [:]
     private var handedOut: Set<String> = []
     private var obs: [String: NSKeyValueObservation] = [:]
@@ -568,8 +570,9 @@ final class DYPreloader {
         let lo = index + 1, hi = min(items.count - 1, index + Self.ahead)
         let window = lo <= hi ? Array(items[lo...hi]) : []
         let ids = Set(window.map(\.id))
-        // 离开窗口的：释放没被领走的；已领走的只要离当前 ≥2 条就不再记账（页面已经销毁）
-        for (id, p) in players where !ids.contains(id) { release(id, p) }
+        // 保留窗口：当前前后各几条（停放的播放器留着），之外的才释放
+        let keep = Set(items[max(0, index - Self.behind)...min(items.count - 1, index + Self.ahead)].map(\.id))
+        for (id, p) in players where !keep.contains(id) { release(id, p) }
         let near = Set(items[max(0, index - 1)...min(items.count - 1, index + 1)].map(\.id))
         handedOut = handedOut.filter { near.contains($0) || ids.contains($0) }
         for a in window where players[a.id] == nil && !handedOut.contains(a.id) {
@@ -599,6 +602,15 @@ final class DYPreloader {
         handedOut.insert(id)
         p.isMuted = false
         return p
+    }
+
+    /// 页面滑走时把播放器连同进度停放回来（暂停、静音），滑回来 take 到的就是它，秒开
+    func park(_ id: String, _ p: AVPlayer) {
+        guard !disabled else { p.pause(); p.replaceCurrentItem(with: nil); return }
+        if let old = players[id], old !== p { release(id, old) }
+        p.pause(); p.isMuted = true
+        players[id] = p
+        handedOut.remove(id)
     }
 
     func clear() {
@@ -1703,6 +1715,7 @@ struct DYVideoPage: View {
                                     isActive: isCurrent, topInset: insets.top, bottomInset: insets.bottom,
                                     resumePosition: resume, compactChrome: true,
                                     preparedPlayer: { preloader.take(item.id) },
+                                    parkPlayer: { preloader.park($0, $1) },
                                     onEnded: nil,
                                     onDoubleTap: {
                                         onDoubleTap()
