@@ -238,8 +238,9 @@ final class DouDuoUITests: XCTestCase {
     /// 按住 1 秒 → 慢慢向右拖到 80% 宽 → 再按 2 秒。没防住的话会被当成横滑快进，进度一下跳十几秒。
     func testLongPressLocksSeek() throws {
         let app = XCUIApplication()
-        // 云端内测：workflow 在 runner 上起了个小服务器喂片（TEST_RUNNER_ 环境变量传不到用例里，直接写死地址）
-        let media = ProcessInfo.processInfo.environment["DOUDUO_MEDIA"] ?? "http://127.0.0.1:8787"
+        // 云端内测：片在 runner 的工作目录里（TEST_RUNNER_ 环境变量传不到用例里，直接写死路径；
+        // 不能走 http：python 小服务器不支持 Range，AVPlayer 一直 unknown，只有 VLC 兜底能播）
+        let media = ProcessInfo.processInfo.environment["DOUDUO_MEDIA"] ?? "/Users/runner/work/DouDuo/DouDuo/media"
         app.launchEnvironment["DOUDUO_LOCALVIDEO"] = media + "/narrow.mp4"
         app.launch()
         sleep(5)
