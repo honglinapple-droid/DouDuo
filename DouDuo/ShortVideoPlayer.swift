@@ -160,9 +160,8 @@ struct PlayerPage: View {
         }
         .overlay(alignment: .bottom) {
             // 贴着物理屏幕底边摆：不管外层容器有没有让开安全区，都忽略
-            if isActive { progressBar.padding(.bottom, Self.barBottomGap).ignoresSafeArea(edges: .bottom) }
+            if isActive { progressBar.padding(.bottom, Self.barBottomGap) }
         }
-        .ignoresSafeArea(edges: .bottom)
         .onAppear {
             if player == nil { setup() }
             DDPlayback.shared.register(playbackID, stop: { pauseForBackground() }, start: { resumeAfterBackground() })
