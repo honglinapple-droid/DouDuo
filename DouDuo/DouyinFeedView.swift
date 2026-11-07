@@ -866,6 +866,7 @@ struct DouyinFeedScreen: View {
             try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
             try? AVAudioSession.sharedInstance().setActive(true)
             im.attach(bridge)
+            DYEmojiStore.shared.load(bridge)
             // 消息用自己的后台网页，不占签名页；晚 2 秒起，先让第一条视频起来
             Task { try? await Task.sleep(nanoseconds: 2_000_000_000); im.start() }
             #if DEBUG
@@ -2291,7 +2292,7 @@ struct DYCommentPanel: View {
                 .frame(width: 32, height: 32).clipShape(Circle())
             VStack(alignment: .leading, spacing: 4) {
                 Text(c.name).font(.caption.weight(.semibold)).foregroundStyle(.themeTextSecondary)
-                Text(c.text).font(.subheadline).foregroundStyle(.themeTextPrimary)
+                DYEmojiText(text: c.text, font: .subheadline, color: .themeTextPrimary, size: 18)
                     .fixedSize(horizontal: false, vertical: true)
                 HStack(spacing: 8) {
                     Text(DYFormat.time(c.time))

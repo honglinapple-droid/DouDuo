@@ -585,7 +585,7 @@ struct DYMessagesScreen: View {
             avatar(c.avatar, size: 50)
             VStack(alignment: .leading, spacing: 5) {
                 Text(c.name).font(.subheadline.weight(.semibold)).foregroundStyle(.white).lineLimit(1)
-                Text(c.last.isEmpty ? " " : c.last).font(.footnote).foregroundStyle(.white.opacity(0.55)).lineLimit(1)
+                DYEmojiText(text: c.last.isEmpty ? " " : c.last, font: .footnote, color: .white.opacity(0.55), size: 14).lineLimit(1)
             }
             Spacer(minLength: 8)
             VStack(alignment: .trailing, spacing: 6) {
@@ -792,10 +792,9 @@ struct DYChatScreen: View {
                 .padding(.horizontal, 12).padding(.vertical, 8)
                 .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(dyBubble))
         default:
-            Text(m.text).font(.body).foregroundStyle(.white)
+            DYEmojiText(text: m.text, font: .body, color: .white, size: 22)
                 .padding(.horizontal, 12).padding(.vertical, 8)
                 .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(m.fromMe ? dyRed : dyBubble))
-                .textSelection(.enabled)
         }
     }
 }
@@ -822,8 +821,12 @@ struct DYMessageMenu: View {
             HStack(spacing: 14) {
                 ForEach(Array(emojis.prefix(6).enumerated()), id: \.offset) { i, e in
                     Button { onEmoji(i) } label: {
-                        Text(DYEmoji.glyph(e)).font(.system(size: 30)).frame(width: 46, height: 46)
-                            .background(Circle().fill(.white.opacity(0.08)))
+                        Group {
+                            if let img = DYEmojiStore.shared.image(e, size: 32) { Image(uiImage: img) }
+                            else { Text(DYEmoji.glyph(e)).font(.system(size: 30)) }
+                        }
+                        .frame(width: 46, height: 46)
+                        .background(Circle().fill(.white.opacity(0.08)))
                     }
                     .buttonStyle(.plain)
                 }
