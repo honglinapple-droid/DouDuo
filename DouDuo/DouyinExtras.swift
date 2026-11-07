@@ -1145,9 +1145,9 @@ struct DYFollowFeed: View {
             if currentID == nil { currentID = m.items.first?.id }
         }
         .onChange(of: refresh) { _, _ in
-            onToast?("正在刷新关注…")
+            onToast("正在刷新关注…")
             preloader.clear(); m.reset(); currentID = nil
-            Task { await m.loadMore(); currentID = m.items.first?.id; onToast?(m.items.isEmpty ? (m.error ?? "关注的人还没有新作品") : "关注已刷新") }
+            Task { await m.loadMore(); currentID = m.items.first?.id; onToast(m.items.isEmpty ? (m.error ?? "关注的人还没有新作品") : "关注已刷新") }
         }
         .onChange(of: currentID) { old, new in
             if new == nil, let old, m.items.contains(where: { $0.id == old }) { currentID = old; return }
