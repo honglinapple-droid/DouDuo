@@ -156,65 +156,79 @@ final class DYRecommender {
         DYLiveModel.log("DDREC seeded h=\(history.count) l=\(likes.count) c=\(collects.count) top=\(p.topTags)")
     }
 
-    /// 拼一批：三路并行 → 去重去看过 → 按模式过滤 → 打分 → 配比上限
-    func batch(_ bridge: DouyinBridge, portraitMode: Int, followed: Set<String>, exclude: Set<String>, want: Int) async -> [DYAweme] {
+    // 旁路备用池：相关推荐 / 关注 两路在后台慢慢拉，拉到打好分放这里，主线每塞一页就从这儿插几条
+    private var pool: [(a: DYAweme, score: Double)] = []
+    private var refilling = false
+    private var followCursor = "0"
+
+    /// 就地过滤 + 打分排序 + 配比上限（纯本地，不发请求）。网页流每页一回来就过这一道
+    func rank(_ page: [DYAweme], portraitMode: Int, followed: Set<String>, exclude: Set<String>) -> [DYAweme] {
         let p = DYTasteProfile.shared
-        // A 相关推荐：拿两条最近的正向种子去问
-        let seeds = Array(p.positives.shuffled().prefix(2))
-        async let a1 = seeds.indices.contains(0) ? (try? bridge.related(seeds[0])) ?? [] : []
-        async let a2 = seeds.indices.contains(1) ? (try? bridge.related(seeds[1])) ?? [] : []
-        // B 关注的人
-        async let b1 = (try? bridge.followFeed(cursor: "0"))?.items ?? []
-        // C 网页推荐流（两页）
-        async let c1 = (try? bridge.fetchFeed())?.items ?? []
-        async let c2 = (try? bridge.fetchFeed())?.items ?? []
-        let (ra1, ra2, rb, rc1, rc2) = await (a1, a2, b1, c1, c2)
-
-        struct Cand { let a: DYAweme; let bonus: Double }
-        var cands: [Cand] = []
-        var ids = Set<String>()
         let blocked = DYTaste.blockedAuthors
-        func add(_ list: [DYAweme], bonus: Double) {
-            for a in list {
-                guard a.play != nil || !a.images.isEmpty, !ids.contains(a.id), !exclude.contains(a.id), p.seen[a.id] == nil else { continue }
-                if let s = a.author.secUid, blocked.contains(s) { continue }
-                ids.insert(a.id); cands.append(Cand(a: a, bonus: bonus))
-            }
-        }
-        add(ra1 + ra2, bonus: 0.6); add(rb, bonus: 0.1); add(rc1 + rc2, bonus: 0)
-        guard !cands.isEmpty else { return [] }
-
         func isFollowed(_ a: DYAweme) -> Bool { (a.author.followStatus ?? 0) >= 1 || a.author.secUid.map { followed.contains($0) } == true }
-        // 竖屏模式：0 全部 / 1 竖屏优先（横屏只留认识的作者）/ 2 只看竖屏
-        cands = cands.filter { c in
-            let a = c.a
-            if !a.images.isEmpty || a.isPortrait { return true }
-            switch portraitMode { case 0: return true; case 1: return isFollowed(a) || p.author[a.author.secUid ?? "", default: 0] > 1; default: return false }
+        var ids = Set<String>()
+        var cands: [DYAweme] = []
+        for a in page {
+            guard a.play != nil || !a.images.isEmpty, !ids.contains(a.id), !exclude.contains(a.id), p.seen[a.id] == nil else { continue }
+            if let sec = a.author.secUid, blocked.contains(sec) { continue }
+            if a.images.isEmpty && !a.isPortrait {
+                // 竖屏模式：0 全部 / 1 竖屏优先（横屏只留认识的作者）/ 2 只看竖屏
+                switch portraitMode { case 0: break; case 1: if !(isFollowed(a) || p.author[a.author.secUid ?? "", default: 0] > 1) { continue }; default: continue }
+            }
+            ids.insert(a.id); cands.append(a)
         }
-        // 打分 + 一点随机，避免每次一模一样
-        let scored = cands.map { c in (c, p.score(c.a) + c.bonus + Double.random(in: -0.15...0.15)) }.sorted { $0.1 > $1.1 }
-
-        // 配比上限：已关注 ≤ 20%，单一分类 ≤ 30%，横屏 ≤ 20%，留 10% 探索
-        let n = max(4, want)
-        let capFollow = max(1, Int(Double(n) * 0.2)), capTag = max(1, Int(Double(n) * 0.3)), capLand = max(1, Int(Double(n) * 0.2))
-        var out: [DYAweme] = [], nFollow = 0, nLand = 0, tagCount: [String: Int] = [:]
-        var leftovers: [DYAweme] = []
-        for (c, _) in scored {
-            let a = c.a
-            if out.count >= n - 1 { leftovers.append(a); continue }
-            let f = isFollowed(a), land = a.images.isEmpty && !a.isPortrait
-            let main = a.tags?.first ?? ""
-            if f && nFollow >= capFollow { leftovers.append(a); continue }
-            if land && nLand >= capLand { leftovers.append(a); continue }
-            if !main.isEmpty && tagCount[main, default: 0] >= capTag { leftovers.append(a); continue }
+        guard !cands.isEmpty else { return [] }
+        // 从备用池插几条（最多 3 条，分数高的先）
+        var extras: [DYAweme] = []
+        pool.sort { $0.score > $1.score }
+        while extras.count < 3, let top = pool.first {
+            pool.removeFirst()
+            guard !ids.contains(top.a.id), !exclude.contains(top.a.id), p.seen[top.a.id] == nil else { continue }
+            if top.a.images.isEmpty && !top.a.isPortrait && portraitMode == 2 { continue }
+            ids.insert(top.a.id); extras.append(top.a)
+        }
+        let scored = (cands.map { ($0, p.score($0) + Double.random(in: -0.15...0.15)) } + extras.map { ($0, p.score($0) + 0.6) }).sorted { $0.1 > $1.1 }
+        // 配比上限：已关注 ≤ 20%，单一分类 ≤ 30%，横屏 ≤ 20%
+        let n = scored.count
+        let capFollow = max(1, Int(Double(n) * 0.2)), capTag = max(2, Int(Double(n) * 0.3)), capLand = max(1, Int(Double(n) * 0.2))
+        var out: [DYAweme] = [], nFollow = 0, nLand = 0, tagCount: [String: Int] = [:], dropped: [DYAweme] = []
+        for (a, _) in scored {
+            let f = isFollowed(a), land = a.images.isEmpty && !a.isPortrait, main = a.tags?.first ?? ""
+            if f && nFollow >= capFollow { dropped.append(a); continue }
+            if land && nLand >= capLand { dropped.append(a); continue }
+            if !main.isEmpty && tagCount[main, default: 0] >= capTag { dropped.append(a); continue }
             out.append(a); if f { nFollow += 1 }; if land { nLand += 1 }; if !main.isEmpty { tagCount[main, default: 0] += 1 }
         }
-        // 探索位：从剩下的里随机来一条
-        if let x = leftovers.shuffled().first, out.count < n { out.append(x) }
-        DYLiveModel.log("DDREC batch cands=\(cands.count) out=\(out.count) follow=\(nFollow) land=\(nLand) seeds=\(seeds.count) A=\(ra1.count + ra2.count) B=\(rb.count) C=\(rc1.count + rc2.count)")
+        // 被配比挤掉的别浪费，扔回备用池（分数打折），下次人少了再上
+        for a in dropped.prefix(10) { pool.append((a, p.score(a) - 1)) }
+        if pool.count > 60 { pool.sort { $0.score > $1.score }; pool.removeLast(pool.count - 60) }
+        DYLiveModel.log("DDREC rank in=\(page.count) cands=\(cands.count) extras=\(extras.count) out=\(out.count) follow=\(nFollow) land=\(nLand) pool=\(pool.count)")
         return out
     }
-}
+
+    /// 后台补备用池：相关推荐（拿最近正向的种子问）+ 关注的人。不重试，拉不到就算；主线不等它
+    func refillPool(_ bridge: DouyinBridge, loggedIn: Bool) {
+        guard !refilling, pool.count < 8 else { return }
+        refilling = true
+        Task {
+            defer { refilling = false }
+            let p = DYTasteProfile.shared
+            let seeds = Array(p.positives.shuffled().prefix(2))
+            async let r1: [DYAweme] = seeds.indices.contains(0) ? ((try? await bridge.related(seeds[0])) ?? []) : []
+            async let r2: [DYAweme] = seeds.indices.contains(1) ? ((try? await bridge.related(seeds[1])) ?? []) : []
+            async let f1: [DYAweme] = loggedIn ? ((try? await bridge.followFeed(cursor: followCursor))?.items ?? []) : []
+            let (a, b, f) = await (r1, r2, f1)
+            let blocked = DYTaste.blockedAuthors
+            var have = Set(pool.map { $0.a.id })
+            for (list, bonus) in [(a + b, 0.6), (f, 0.1)] {
+                for x in list where x.play != nil || !x.images.isEmpty {
+                    guard !have.contains(x.id), p.seen[x.id] == nil, !(x.author.secUid.map { blocked.contains($0) } ?? false) else { continue }
+                    have.insert(x.id); pool.append((x, p.score(x) + bonus))
+                }
+            }
+            DYLiveModel.log("DDREC refill related=\(a.count + b.count) follow=\(f.count) pool=\(pool.count)")
+        }
+    }
 
 extension DouyinBridge {
     private struct RelatedResp: Decodable { let status: Int; let items: [DYAweme] }

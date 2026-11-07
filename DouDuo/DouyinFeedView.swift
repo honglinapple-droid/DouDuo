@@ -745,16 +745,29 @@ final class DYFeedModel: ObservableObject {
         var added = 0
         let want = wantOverride ?? (portraitOnly ? 6 : 1)
         if localRec {
-            // 本地推荐器：三路并行拼一批，已经按模式过滤、打分、配比好了
-            let page = await DYRecommender.shared.batch(bridge, portraitMode: portraitMode, followed: followed,
-                                                        exclude: Set(items.map(\.id)), want: max(want, 8))
-            added += absorb(page, hasMore: true, prefiltered: true)
-            if added == 0 {
-                // 推荐器一条都没拼出来（没登录 / 接口抽风）：退回原来的网页流
-                if let r = try? await bridge.fetchFeed() { added += absorb(r.items, hasMore: r.hasMore) }
+            // 本地推荐器：主线还是作者那套（一次一个网页流请求、来了就塞），只是每页回来先就地过滤排序，
+            // 再从后台备用池插几条；备用池（相关推荐 / 关注）在后台补，主线不等它
+            let rounds: [Int] = portraitOnly ? [1, 2, 2] : [1, 1]
+            do {
+                for n in rounds {
+                    let pages: [(items: [DYAweme], hasMore: Bool)] = try await withThrowingTaskGroup(of: (items: [DYAweme], hasMore: Bool).self) { g in
+                        for _ in 0..<n { g.addTask { try await bridge.fetchFeed() } }
+                        var out: [(items: [DYAweme], hasMore: Bool)] = []
+                        for try await r in g { out.append(r) }
+                        return out
+                    }
+                    for r in pages {
+                        let ranked = DYRecommender.shared.rank(r.items, portraitMode: portraitMode, followed: followed, exclude: Set(items.map(\.id)))
+                        added += absorb(ranked, hasMore: true, prefiltered: true)
+                    }
+                    if added >= want { break }
+                }
+            } catch {
+                if items.isEmpty { self.error = error.localizedDescription }
             }
             hasMore = true
-            error = (items.isEmpty && added == 0) ? "暂时没刷到推荐，登录后或稍后再试" : nil
+            if items.isEmpty && added == 0 && error == nil { error = "暂时没刷到推荐，登录后或稍后再试" }
+            DYRecommender.shared.refillPool(bridge, loggedIn: isLoggedIn || !followed.isEmpty)
             return
         }
         // 分轮拉：第一轮 1 个请求（快），不够再并行 3 个，最多 3 轮。原来是最多 8 个一个接一个
