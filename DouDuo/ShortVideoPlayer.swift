@@ -88,10 +88,10 @@ extension PlayerPage {
 }
 
 struct PlayerPage: View {
-    /// 沉底布局：进度条控件距屏幕底边（细线本身再高 8pt，共 18pt，刚好让开 Home 条）
-    static let barBottomGap: CGFloat = 10
+    /// 沉底布局：进度条控件距物理屏幕底边（细线本身再高 8pt，共 16pt，刚好让开 Home 条）
+    static let barBottomGap: CGFloat = 8
     /// 沉底布局：文案距屏幕底边（在时间文字上方）
-    static let captionBottomGap: CGFloat = 50
+    static let captionBottomGap: CGFloat = 44
 
     let id: String
     let url: URL
@@ -168,8 +168,10 @@ struct PlayerPage: View {
             }
         }
         .overlay(alignment: .bottom) {
-            if isActive { progressBar.padding(.bottom, Self.barBottomGap) }
+            // 贴着物理屏幕底边摆：不管外层容器有没有让开安全区（折叠屏/iPad 布局下可能没有），都忽略
+            if isActive { progressBar.padding(.bottom, Self.barBottomGap).ignoresSafeArea(edges: .bottom) }
         }
+        .ignoresSafeArea(edges: .bottom)
         .onAppear {
             if player == nil { setup() }
             DDPlayback.shared.register(playbackID, stop: { pauseForBackground() }, start: { resumeAfterBackground() })

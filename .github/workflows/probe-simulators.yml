@@ -1,0 +1,56 @@
+name: Probe iPhone simulators
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: macos-26
+    timeout-minutes: 20
+    steps:
+      - name: Xcode and simulator inventory
+        run: |
+          xcodebuild -version
+          echo "=== runtimes ==="; xcrun simctl list runtimes
+          echo "=== iPhone device types ==="; xcrun simctl list devicetypes | grep -i iphone
+          echo "=== simctl subcommands ==="; xcrun simctl help 2>&1 | head -80
+      - name: Dump device profiles (screen size, scale, folding)
+        run: |
+          mkdir -p out
+          DT="$(xcode-select -p)/Platforms/iPhoneOS.platform/Library/Developer/CoreSimulator/Profiles/DeviceTypes"
+          ls "$DT" | tee out/devicetypes.txt
+          for d in "$DT"/*.simdevicetype; do
+            n=$(basename "$d" .simdevicetype)
+            case "$n" in *Duo*|*Fold*|*iPhone\ 17*|*iPhone\ 18*)
+              echo "=============== $n"
+              for f in profile.plist capabilities.plist; do
+                [ -f "$d/Contents/Resources/$f" ] && { echo "--- $f"; plutil -p "$d/Contents/Resources/$f"; }
+              done
+              cp -R "$d/Contents/Resources" "out/$n" 2>/dev/null || true
+              ;;
+            esac
+          done | tee out/profiles.txt
+      - name: Boot a Duo simulator and take screenshots
+        run: |
+          set +e
+          NAME=$(xcrun simctl list devicetypes | grep -iE "duo|fold" | head -1 | sed -E 's/ \(com\.apple.*//')
+          echo "device: $NAME"
+          [ -z "$NAME" ] && { echo "no foldable device type found"; exit 0; }
+          RT=$(xcrun simctl list runtimes | grep -i "iOS" | tail -1 | grep -oE "com\.apple\.CoreSimulator\.SimRuntime\.iOS[-0-9]+")
+          UDID=$(xcrun simctl create probe "$NAME" "$RT")
+          xcrun simctl boot "$UDID"; xcrun simctl bootstatus "$UDID" -b
+          sleep 10
+          xcrun simctl io "$UDID" screenshot out/duo-portrait.png
+          xcrun simctl ui "$UDID" --help 2>&1 | head -40
+          for a in fold unfold; do xcrun simctl ui "$UDID" $a 2>&1 | head -5; done
+          xcrun simctl io "$UDID" screenshot out/duo-after-toggle.png 2>/dev/null
+          sips -g pixelWidth -g pixelHeight out/*.png
+          xcrun simctl shutdown "$UDID"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: simulator-probe
+          path: out
+          retention-days: 14
