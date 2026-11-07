@@ -866,6 +866,7 @@ struct DouyinFeedScreen: View {
     @State private var followPanelInset: CGFloat = 0
     /// 铰链状态（iPhone Duo）：半折叠且评论开着 → 视频占折痕左边、评论铺满折痕右边
     @State private var hinge: DYHinge = .none
+    @State private var hingeOpenedComments = false
     @State private var saveTask: Task<Void, Never>?
     @State private var web: DYWebTarget?
     @State private var tab: DYTab = ProcessInfo.processInfo.environment["DOUDUO_STARTLIVE"] == "1" ? .live : .recommend
@@ -901,6 +902,12 @@ struct DouyinFeedScreen: View {
             }
             .animation(.spring(response: 0.45, dampingFraction: 0.85), value: hinge)
             .dyHinge($hinge)
+            .onChange(of: hinge) { old, new in
+                // 半折叠：评论区自动跑出来（视频在折痕左、评论在折痕右）；展平 / 合上时把自动打开的收回
+                guard tab == .recommend else { return }
+                if new.isHalfOpen, !showComments { withAnimation(.spring(response: 0.45, dampingFraction: 0.85)) { showComments = true }; hingeOpenedComments = true }
+                else if old.isHalfOpen, !new.isHalfOpen, hingeOpenedComments { withAnimation(.snappy) { showComments = false }; hingeOpenedComments = false }
+            }
             .background(theme.media.strongScrim.color(for: scheme).ignoresSafeArea())
             .onAppear { insets = geo.safeAreaInsets; narrow = geo.size.width < 520 }
             .onChange(of: geo.safeAreaInsets) { _, v in insets = v }
@@ -2277,8 +2284,6 @@ struct DYVideoPage: View {
         Button(action: act) {
             VStack(spacing: 3) {
                 Image(systemName: icon).font(.system(size: theme.typography.pointSize(.displayLarge))).foregroundStyle(tint)
-                    .frame(width: 48, height: 48)
-                    .dyGlass(in: Circle())
                 Text(text).font(.caption2.weight(.semibold)).foregroundStyle(theme.media.onMedia.color(for: scheme))
             }
         }

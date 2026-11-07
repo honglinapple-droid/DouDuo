@@ -1102,6 +1102,7 @@ struct DYFollowFeed: View {
     @State private var liked: Set<String> = []
     @State private var collected: Set<String> = []
     @State private var showComments = false
+    @State private var hingeOpened = false
 
     var body: some View {
         let m = model.model(bridge)
@@ -1169,7 +1170,12 @@ struct DYFollowFeed: View {
         }
         .onChange(of: showComments) { _, open in onCommentsPanel?(open && wide ? geo.dyPanelWidth(hinge: hinge, commentsOpen: true) : 0) }
         .onChange(of: wide) { _, w in onCommentsPanel?(showComments && w ? geo.dyPanelWidth(hinge: hinge, commentsOpen: true) : 0) }
-        .onChange(of: hinge) { _, _ in onCommentsPanel?(showComments && wide ? geo.dyPanelWidth(hinge: hinge, commentsOpen: true) : 0) }
+        .onChange(of: hinge) { old, new in
+            // 半折叠：评论区自动跑出来；展平 / 合上时把自动打开的收回
+            if new.isHalfOpen, !showComments { withAnimation(.spring(response: 0.45, dampingFraction: 0.85)) { showComments = true }; hingeOpened = true }
+            else if old.isHalfOpen, !new.isHalfOpen, hingeOpened { withAnimation(.snappy) { showComments = false }; hingeOpened = false }
+            onCommentsPanel?(showComments && wide ? geo.dyPanelWidth(hinge: new, commentsOpen: true) : 0)
+        }
         .animation(.spring(response: 0.45, dampingFraction: 0.85), value: hinge)
         }
         .task {
