@@ -216,14 +216,17 @@ private enum DYIMJS {
     for (let i = 0; i < 20; i++) { await sleep(150); modal = [...document.querySelectorAll('.semi-modal-content')].find(m => /选择朋友/.test(m.innerText || '')); if (modal) break; }
     if (!modal) return JSON.stringify({ ok: false, why: 'no-picker' });
     const rows = [...modal.querySelectorAll('.ShareMessageFriendPickerModalconversationItem')];
-    const row = rows.find(r => txt(r).split('\n')[0].trim() === name) || rows.find(r => txt(r).includes(name));
-    if (!row) { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); return JSON.stringify({ ok: false, why: 'no-friend', n: rows.length }); }
+    // 行文字形如「iebbiyz 3 发送」：按开头匹配名字
+    const row = rows.find(r => txt(r).startsWith(name + ' ') || txt(r) === name) || rows.find(r => txt(r).startsWith(name));
+    const closeModal2 = () => { const c = modal.querySelector('.ShareMessageFriendPickerModalheaderClose') || modal.querySelector('[class*=headerClose]'); if (c) fire(c); };
+    if (!row) { closeModal2(); return JSON.stringify({ ok: false, why: 'no-friend', n: rows.length }); }
     const sendBtn = row.querySelector('.ShareMessageFriendPickerModalsendButton');
     const label0 = txt(sendBtn);
     fire(sendBtn);
     let changed = false;
-    for (let k = 0; k < 12; k++) { await sleep(150); if (!document.body.contains(sendBtn) || txt(sendBtn) !== label0 || !document.querySelector('.semi-modal-content')) { changed = true; break; } }
-    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    for (let k = 0; k < 15; k++) { await sleep(150); const t1 = document.body.contains(sendBtn) ? txt(sendBtn) : ''; if (t1 !== label0) { changed = true; break; } }
+    await sleep(400);
+    closeModal2();
     await sleep(300);
     closeMenu();
     return JSON.stringify({ ok: true, changed });
