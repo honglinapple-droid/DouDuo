@@ -989,6 +989,15 @@ struct DouyinFeedScreen: View {
         }
         .onChange(of: cacheCount) { _, _ in focusCurrent() }
         .onChange(of: currentID) { _, _ in if tab == .recommend { scheduleNextBatch() } }
+        .task(id: "tail-watchdog") {
+            // 到底看门狗：滑到最后一条还没下一批时，每 2 秒自动补拉，不受节流（之前到底就卡死的根源）
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                guard tab == .recommend, !refreshing, !feed.loading, let i = currentIndex, feed.items.count - i - 1 <= 1 else { continue }
+                await feed.loadMore(bridge)
+                focusCurrent()
+            }
+        }
         .onChange(of: feed.localRec) { _, _ in
             nextBatches = []
             preloader.clear(); feed.reset(); currentID = nil
@@ -1076,7 +1085,7 @@ struct DouyinFeedScreen: View {
             replacement = DYFeedModel()
             replacement.followed = feed.followed
             // 凑够 4 条再换，不再边塞边播（边塞边播画面会一跳一跳）
-            await replacement.loadMore(bridge, want: 4)
+            await replacement.loadMore(bridge, want: 6)
             guard !Task.isCancelled else { return }
         }
         let fresh = replacement.items.filter { !previous.contains($0.id) }
@@ -1101,10 +1110,12 @@ struct DouyinFeedScreen: View {
         // 强制回到第一条（列表刚换完这一帧 scrollPosition 有时不生效，下一帧再设一次）
         let first = fresh.first?.id
         DispatchQueue.main.async { scrollID = first; currentID = first }
-        lastFeedPull = Date()
+        lastFeedPull = .distantPast   // 换批后马上允许补拉，不受 4 秒节流
         saveSession()
         showToast("推荐已刷新")
         DYLiveModel.log("DDREFRESH ok n=\(fresh.count) first=\(currentID ?? "-") instant=\(instant)")
+        // 换上的这批短，立刻补拉一次（作者原版就这么干的，前几版把这句丢了）
+        Task { await feed.loadMore(bridge); focusCurrent() }
         scheduleNextBatch()
     }
 
@@ -1120,7 +1131,7 @@ struct DouyinFeedScreen: View {
                 guard !refreshing, !feed.items.isEmpty else { break }
                 let m = DYFeedModel()
                 m.followed = feed.followed
-                await m.loadMore(bridge, want: 4)
+                await m.loadMore(bridge, want: 8)
                 let seen = Set(feed.items.map(\.id)).union(nextBatches.flatMap { $0.items.map(\.id) })
                 m.items.removeAll { seen.contains($0.id) }
                 guard !m.items.isEmpty else { break }
