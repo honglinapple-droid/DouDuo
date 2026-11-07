@@ -229,6 +229,7 @@ final class DYRecommender {
             DYLiveModel.log("DDREC refill related=\(a.count + b.count) follow=\(f.count) pool=\(pool.count)")
         }
     }
+}
 
 extension DouyinBridge {
     private struct RelatedResp: Decodable { let status: Int; let items: [DYAweme] }
