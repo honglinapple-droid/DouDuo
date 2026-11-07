@@ -211,20 +211,22 @@ private enum DYIMJS {
     const it = [...m.querySelectorAll('.MessageOperatePopBodybuttonItem')].find(x => txt(x.querySelector('.MessageOperatePopBodydesc')) === '分享');
     if (!it) { closeMenu(); return JSON.stringify({ ok: false, why: 'no-share' }); }
     fire(it);
-    let panel = null;
-    for (let i = 0; i < 20; i++) { await sleep(150); panel = [...document.querySelectorAll('.imContainer *')].find(e => e.childElementCount === 0 && txt(e) === '选择朋友'); if (panel) break; }
-    if (!panel) return JSON.stringify({ ok: false, why: 'no-picker' });
-    let root = panel; for (let i = 0; i < 8 && root && !root.querySelector('img'); i++) root = root.parentElement;
-    const rows = [...root.querySelectorAll('*')].filter(e => e.querySelector('img') && [...e.children].length >= 2 && [...e.querySelectorAll('*')].some(x => x.childElementCount === 0 && txt(x) === '发送') && e.getBoundingClientRect().height > 36 && e.getBoundingClientRect().height < 90);
-    const row = rows.find(r => txt(r).split('\n').map(s => s.trim()).includes(name)) || rows.find(r => txt(r).includes(name));
-    if (!row) { closeMenu(); return JSON.stringify({ ok: false, why: 'no-friend', n: rows.length }); }
-    const sendBtn = [...row.querySelectorAll('*')].find(x => x.childElementCount === 0 && txt(x) === '发送');
+    // 「选择朋友」是一个 semi-modal 弹窗，不在消息面板里
+    let modal = null;
+    for (let i = 0; i < 20; i++) { await sleep(150); modal = [...document.querySelectorAll('.semi-modal-content')].find(m => /选择朋友/.test(m.innerText || '')); if (modal) break; }
+    if (!modal) return JSON.stringify({ ok: false, why: 'no-picker' });
+    const rows = [...modal.querySelectorAll('.ShareMessageFriendPickerModalconversationItem')];
+    const row = rows.find(r => txt(r).split('\n')[0].trim() === name) || rows.find(r => txt(r).includes(name));
+    if (!row) { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); return JSON.stringify({ ok: false, why: 'no-friend', n: rows.length }); }
+    const sendBtn = row.querySelector('.ShareMessageFriendPickerModalsendButton');
+    const label0 = txt(sendBtn);
     fire(sendBtn);
-    await sleep(600);
-    for (let k = 0; k < 6; k++) { const c = [...document.querySelectorAll('button, div[role=button], span, div')].find(e => e.childElementCount <= 1 && txt(e) === '发送' && !root.contains(e) && e.getBoundingClientRect().width > 0 && e.closest('[class*=modal], [class*=Modal], [class*=dialog], [class*=Dialog], [class*=confirm], [class*=Confirm]')); if (c) { fire(c); break; } await sleep(150); }
-    await sleep(800);
+    let changed = false;
+    for (let k = 0; k < 12; k++) { await sleep(150); if (!document.body.contains(sendBtn) || txt(sendBtn) !== label0 || !document.querySelector('.semi-modal-content')) { changed = true; break; } }
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    await sleep(300);
     closeMenu();
-    return JSON.stringify({ ok: true });
+    return JSON.stringify({ ok: true, changed });
     """#
 
     /// 取消回复
