@@ -15,6 +15,10 @@ enum DouyinWeb {
     static let userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15"
 
     /// 直接打开 ?recommend=1 首次会被导回「精选」，点导航栏「推荐」才稳
+    /// 从顶栏「消息」进来：页面加载完自动点网页版的「私信」入口
+    static var pendingAutoIM = false
+    static let openIMJS = "(()=>{const els=[...document.querySelectorAll('a,div,span,button,p')].filter(e=>e.childElementCount===0&&e.innerText&&e.innerText.trim()==='私信');if(!els.length)return 'none';const e=els[0];e.click();const c=e.closest('a,button,[role=button]')||e.parentElement;if(c)c.click();return 'clicked'})()"
+
     static let goRecommendJS = "(()=>{const a=[...document.querySelectorAll('a')].find(a=>a.innerText.trim()==='推荐');if(a){a.click();return true}location.href='https://www.douyin.com/?recommend=1';return false})()"
 
     static let bootstrapJS = #"""
@@ -238,6 +242,19 @@ final class DouyinWebModel: NSObject, ObservableObject, WKNavigationDelegate, WK
             }
         }
         #endif
+        if DouyinWeb.pendingAutoIM {
+            DouyinWeb.pendingAutoIM = false
+            // 等页面脚本把顶栏画出来再点；第一次没找到再试两次
+            func tryOpen(_ n: Int) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + (n == 0 ? 2.5 : 2.0)) {
+                    webView.evaluateJavaScript(DouyinWeb.openIMJS) { r, _ in
+                        if (r as? String) != "clicked", n < 2 { tryOpen(n + 1) }
+                    }
+                }
+            }
+            tryOpen(0)
+            return
+        }
         guard !jumpedToFeed, webView.url?.path.hasPrefix("/jingxuan") == true else { return }
         jumpedToFeed = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { webView.evaluateJavaScript(DouyinWeb.goRecommendJS) }

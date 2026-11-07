@@ -30,11 +30,26 @@ struct DYAweme: Identifiable, Codable, Equatable {
     let isCollect: Int?
     /// 0=视频 68=图文；上报观看时要带
     var awemeType: Int? = nil
+    /// 封面宽高：接口里视频宽高偶尔标错，用封面再核一遍
+    var coverW: Double? = nil
+    var coverH: Double? = nil
 
-    struct Author: Codable, Equatable { let name: String; let avatar: String?; let secUid: String?; var uid: String? = nil }
+    /// followStatus：0 未关注 1 已关注 2 互相关注（未登录时都是 0）
+    struct Author: Codable, Equatable { let name: String; let avatar: String?; let secUid: String?; var uid: String? = nil; var followStatus: Int? = nil }
     struct Stats: Codable, Equatable { let digg: Int; let comment: Int; let collect: Int; let share: Int }
 
-    var isPortrait: Bool { height > width * 1.05 }
+    /// 竖屏判断：视频宽高和封面宽高都说竖屏才算（接口偶尔把横屏标成竖屏，封面可以兜住）
+    var isPortrait: Bool {
+        let v: Bool? = (width > 0 && height > 0) ? (height > width * 1.05) : nil
+        let cw = coverW ?? 0, ch = coverH ?? 0
+        let c: Bool? = (cw > 0 && ch > 0) ? (ch > cw * 1.05) : nil
+        switch (v, c) {
+        case let (v?, c?): return v && c
+        case let (v?, nil): return v
+        case let (nil, c?): return c
+        default: return false
+        }
+    }
     var webURL: URL { URL(string: "https://www.douyin.com/video/\(id)")! }
 }
 
@@ -229,6 +244,13 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
         return Self.interpret(r)
     }
 
+    /// 关注 / 取关作者：网页版同一个接口（commit/follow/user）
+    func follow(_ secUid: String, follow: Bool) async throws -> DYActionResult {
+        let d = try await call(Self.followJS, args: ["sec": secUid, "type": follow ? "1" : "0"], attempts: 2)
+        let r = try JSONDecoder().decode(DYActionResp.self, from: d)
+        return Self.interpret(r)
+    }
+
     /// 统一解读：status_code 8 = 用户未登录；0 = 成功
     private static func interpret(_ r: DYActionResp) -> DYActionResult {
         if r.status == 200, (r.statusCode ?? 0) == 0 { return .ok }
@@ -405,6 +427,13 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
     return JSON.stringify({ status: r.s, statusCode: d.status_code, msg: d.status_msg || (r.s === 200 ? '' : (r.t || '').slice(0, 120)) });
     """#
 
+    private static let followJS = #"""
+    const r = await req('POST', '/aweme/v1/web/commit/follow/user/?' + q({}),
+      new URLSearchParams({ sec_user_id: sec, type: type, channel_id: '3', from: '1', from_pre: '-1' }).toString());
+    const d = parse(r.t) || {};
+    return JSON.stringify({ status: r.s, statusCode: d.status_code, msg: d.status_msg || (r.s === 200 ? '' : (r.t || '').slice(0, 120)) });
+    """#
+
     private static let favJS = #"""
     const P = Object.assign({}, base, { aweme_id: id, action: action });
     const tries = ['/aweme/v1/web/commit/item/collect/', '/aweme/v1/web/aweme/collect/'];
@@ -456,8 +485,11 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
         play: urls.find(u => u.includes('/aweme/v1/play/')) || urls[urls.length - 1] || null,
         cover: first(v.cover) || first(v.origin_cover) || (a.images && a.images[0] && first(a.images[0])) || null,
         images: (a.images || []).map(i => first(i)).filter(Boolean),
-        author: { name: (a.author && a.author.nickname) || '', avatar: a.author && first(a.author.avatar_thumb), secUid: a.author && a.author.sec_uid, uid: a.author && a.author.uid ? String(a.author.uid) : null },
+        author: { name: (a.author && a.author.nickname) || '', avatar: a.author && first(a.author.avatar_thumb), secUid: a.author && a.author.sec_uid, uid: a.author && a.author.uid ? String(a.author.uid) : null,
+                  followStatus: (a.author && a.author.follow_status != null) ? a.author.follow_status : null },
         awemeType: a.aweme_type || 0,
+        coverW: (v.cover && v.cover.width) || (v.origin_cover && v.origin_cover.width) || 0,
+        coverH: (v.cover && v.cover.height) || (v.origin_cover && v.origin_cover.height) || 0,
         stats: { digg: st.digg_count || 0, comment: st.comment_count || 0, collect: st.collect_count || 0, share: st.share_count || 0 },
         music: (a.music && a.music.title) || '',
         userDigged: a.user_digged ? 1 : 0,
@@ -558,6 +590,8 @@ final class DYPreloader {
     static let behind = 2
     private var players: [String: AVPlayer] = [:]
     private var handedOut: Set<String> = []
+    /// 钉住的：刷新前备好的「下一批第一条」，滚动时不释放
+    private var pinned: Set<String> = []
     private var obs: [String: NSKeyValueObservation] = [:]
     #if DEBUG
     var disabled = ProcessInfo.processInfo.environment["WUWEI_DEBUG_DOUYIN_NOPRELOAD"] == "1"
@@ -571,7 +605,7 @@ final class DYPreloader {
         let window = lo <= hi ? Array(items[lo...hi]) : []
         let ids = Set(window.map(\.id))
         // 保留窗口：当前前后各几条（停放的播放器留着），之外的才释放
-        let keep = Set(items[max(0, index - Self.behind)...min(items.count - 1, index + Self.ahead)].map(\.id))
+        let keep = Set(items[max(0, index - Self.behind)...min(items.count - 1, index + Self.ahead)].map(\.id)).union(pinned)
         for (id, p) in players where !keep.contains(id) { release(id, p) }
         let near = Set(items[max(0, index - 1)...min(items.count - 1, index + 1)].map(\.id))
         handedOut = handedOut.filter { near.contains($0) || ids.contains($0) }
@@ -595,8 +629,28 @@ final class DYPreloader {
         }
     }
 
+    /// 提前把某条准备好并钉住（刷新用：换批时第一条秒开）
+    func warm(_ a: DYAweme) {
+        guard !disabled, players[a.id] == nil, a.images.isEmpty, let s = a.play, let url = URL(string: s) else { return }
+        let item = AVPlayerItem(asset: DYMedia.asset(DYVideoCache.localURL(a.id) ?? url))
+        item.preferredForwardBufferDuration = 6
+        let p = AVPlayer(playerItem: item)
+        p.isMuted = true
+        p.automaticallyWaitsToMinimizeStalling = true
+        players[a.id] = p
+        pinned.insert(a.id)
+        obs[a.id] = item.observe(\.status, options: [.new]) { [weak p] it, _ in
+            guard it.status == .readyToPlay else { return }
+            DispatchQueue.main.async { p?.preroll(atRate: 1) { _ in } }
+        }
+        if let c = a.cover.flatMap(URL.init(string:)) { Task { _ = await ImageCache.shared.load(c) } }
+    }
+
+    func unpinAll() { pinned.removeAll() }
+
     /// 页面起播时来领；领走后由页面负责释放
     func take(_ id: String) -> AVPlayer? {
+        pinned.remove(id)
         guard let p = players.removeValue(forKey: id) else { return nil }
         obs.removeValue(forKey: id)?.invalidate()
         handedOut.insert(id)
@@ -616,6 +670,7 @@ final class DYPreloader {
     func clear() {
         for (id, p) in players { release(id, p) }
         handedOut.removeAll()
+        pinned.removeAll()
     }
 
     private func release(_ id: String, _ p: AVPlayer) {
@@ -623,6 +678,16 @@ final class DYPreloader {
         p.pause()
         p.replaceCurrentItem(with: nil)
         players[id] = nil
+    }
+}
+
+/// 本地口味档案：隔离模式下所有学习只存在手机里，不往抖音写
+enum DYTaste {
+    private static let blockedKey = "douyin_taste_blocked_authors_v1"
+    /// 点过「不感兴趣」的作者（sec_uid），以后拉到他的视频直接不显示
+    static var blockedAuthors: Set<String> {
+        get { Set(UserDefaults.standard.stringArray(forKey: blockedKey) ?? []) }
+        set { UserDefaults.standard.set(Array(newValue), forKey: blockedKey) }
     }
 }
 
@@ -638,43 +703,72 @@ final class DYFeedModel: ObservableObject {
     @Published var toast: String?
     /// 是否已登录抖音（登录后推荐流才按账号个性化，点赞/收藏才能进账号）
     @Published var isLoggedIn = false
-    private var hasMore = true
+    var hasMore = true
 
     /// 电脑版推荐流给匿名用户大多是横屏长视频（实测竖屏只占一两成），默认只留竖屏 + 图集，
     /// 不够就连拉几页补齐；菜单里可关掉
     /// 默认关：网页版推荐约八成是横屏，只留竖屏会把很多对口味的视频滤掉（2026-11 老板拍板默认关）
-    @AppStorage("douyin_portrait_only_v3") var portraitOnly = true   // 用户要求默认开
+    /// 0 全部 / 1 竖屏优先（横屏只留已关注的作者，且一批里不超两成）/ 2 只看竖屏
+    @AppStorage("douyin_portrait_mode_v1") var portraitMode = 1
+    var portraitOnly: Bool { portraitMode != 0 }
+    /// 已关注的作者（sec_uid），从接口 follow_status 和你点关注的动作汇总
+    @Published var followed: Set<String> = []
     /// 视频比屏幕窄（左右黑边）时自动放大铺满宽度；菜单里可关
     @AppStorage("douyin_autofit_v1") var autoFit = true
 
-    func loadMore(_ bridge: DouyinBridge) async {
+    /// want：这次至少凑够几条。刷新时传 1：第一条到手就先播，其余后台补
+    func loadMore(_ bridge: DouyinBridge, want wantOverride: Int? = nil) async {
         guard !loading, hasMore || items.isEmpty else { return }
         loading = true
         defer { loading = false }
         var added = 0
-        let want = portraitOnly ? 6 : 1
+        let want = wantOverride ?? (portraitOnly ? 6 : 1)
+        // 分轮拉：第一轮 1 个请求（快），不够再并行 3 个，最多 3 轮。原来是最多 8 个一个接一个
+        let rounds: [Int] = portraitOnly ? [1, 3, 3] : [1]
         do {
-            for _ in 0..<(portraitOnly ? 8 : 1) {
-                let r = try await bridge.fetchFeed()
-                let seen = Set(items.map(\.id))
-                let fresh = r.items.filter { a in
-                    !seen.contains(a.id) && (a.play != nil || !a.images.isEmpty)
-                        && (!portraitOnly || !a.images.isEmpty || a.isPortrait)
+            for n in rounds {
+                let pages: [(items: [DYAweme], hasMore: Bool)] = try await withThrowingTaskGroup(of: (items: [DYAweme], hasMore: Bool).self) { g in
+                    for _ in 0..<n { g.addTask { try await bridge.fetchFeed() } }
+                    var out: [(items: [DYAweme], hasMore: Bool)] = []
+                    for try await r in g { out.append(r) }
+                    return out
                 }
-                items.append(contentsOf: fresh)
-                // 账号里已点赞/已收藏的，进页面就是选中态
-                for a in fresh {
-                    if a.userDigged == 1 { liked.insert(a.id) }
-                    if a.isCollect == 1 { collected.insert(a.id) }
-                }
-                added += fresh.count
-                hasMore = r.hasMore || !r.items.isEmpty
+                for r in pages { added += absorb(r.items, hasMore: r.hasMore) }
                 if added >= want || !hasMore { break }
             }
-            error = (items.isEmpty && added == 0) ? portraitOnly ? "暂时没刷到竖屏视频，可在菜单里关掉「只看竖屏」或登录后再试" : "暂时没刷到推荐，登录后或稍后再试" : nil
+            error = (items.isEmpty && added == 0) ? portraitOnly ? "暂时没刷到竖屏视频，可在菜单里把竖屏模式改成「全部」或登录后再试" : "暂时没刷到推荐，登录后或稍后再试" : nil
         } catch {
             if items.isEmpty { self.error = error.localizedDescription }
         }
+    }
+
+    /// 把一页结果按规则收进列表：去重、去掉拉黑作者、按竖屏模式过滤。返回收进来几条
+    @discardableResult
+    private func absorb(_ page: [DYAweme], hasMore more: Bool) -> Int {
+        let seen = Set(items.map(\.id))
+        let blocked = DYTaste.blockedAuthors
+        var landscapeQuota = max(1, page.count / 5)   // 竖屏优先：一页里横屏最多两成
+        var fresh: [DYAweme] = []
+        for a in page {
+            guard !seen.contains(a.id), a.play != nil || !a.images.isEmpty else { continue }
+            if let sec = a.author.secUid, blocked.contains(sec) { continue }
+            if !a.images.isEmpty || a.isPortrait { fresh.append(a); continue }
+            switch portraitMode {
+            case 0: fresh.append(a)
+            case 1:
+                let known = (a.author.followStatus ?? 0) >= 1 || a.author.secUid.map { followed.contains($0) } == true
+                if known && landscapeQuota > 0 { landscapeQuota -= 1; fresh.append(a) }
+            default: break
+            }
+        }
+        items.append(contentsOf: fresh)
+        for a in fresh {
+            if a.userDigged == 1 { liked.insert(a.id) }
+            if a.isCollect == 1 { collected.insert(a.id) }
+            if (a.author.followStatus ?? 0) >= 1, let sec = a.author.secUid { followed.insert(sec) }
+        }
+        hasMore = more || !page.isEmpty
+        return fresh.count
     }
 
     func reset() { items = []; hasMore = true; error = nil }
@@ -689,6 +783,11 @@ struct DouyinFeedScreen: View {
     @State private var insets = EdgeInsets()
     /// 防误触：进度条贴底后，底边上滑第一下先给 App（拖进度条），连划两下才回桌面
     @AppStorage("douyin_defer_bottom_gesture_v1") private var deferBottomGesture = true
+    /// 刷新提速：后台提前拼好的「下一批」，点刷新直接换上，不等网络
+    @State private var nextBatch: DYFeedModel?
+    @State private var preparingNext = false
+    /// 隔离模式：不把播放/观看记录和「不感兴趣」报给抖音，所有学习只在手机本地，不影响手机正版抖音的推荐
+    @AppStorage("douyin_isolation_v1") private var isolation = true
     @State private var showScreenInfo = false
     @State private var screenInfo = ""
     @State private var preloader = DYPreloader()
@@ -829,7 +928,9 @@ struct DouyinFeedScreen: View {
             if DDPlayback.shared.appIsActive { saveSession() }
         }
         .onChange(of: cacheCount) { _, _ in focusCurrent() }
-        .onChange(of: feed.portraitOnly) { _, _ in
+        .onChange(of: currentID) { _, _ in if tab == .recommend { scheduleNextBatch() } }
+        .onChange(of: feed.portraitMode) { _, _ in
+            nextBatch = nil
             preloader.clear(); feed.reset(); currentID = nil
             Task { await feed.loadMore(bridge); currentID = feed.items.first?.id; focusCurrent() }
         }
@@ -849,6 +950,7 @@ struct DouyinFeedScreen: View {
 
     /// 换条时：上一条看完没有（≥95%，网页版同口径）+ 新一条起播 1.5 秒后上报
     private func reportWatch(old: String?, new: String?) {
+        guard !isolation else { return }   // 隔离模式：不上报
         guard let new, let item = feed.items.first(where: { $0.id == new }) else { return }
         var seen = false
         if let old, let prev = feed.items.first(where: { $0.id == old }), prev.duration > 0,
@@ -870,6 +972,12 @@ struct DouyinFeedScreen: View {
     }
 
     private func selectTab(_ target: DYTab) {
+        if target == .messages {
+            // 消息：先打开网页版的私信页（原生界面是下一步）
+            DouyinWeb.pendingAutoIM = true
+            web = DYWebTarget(url: DouyinWeb.home)
+            return
+        }
         if tab == .recommend && target == .recommend {
             Task { await refreshRecommendations() }
         } else {
@@ -882,16 +990,26 @@ struct DouyinFeedScreen: View {
         guard !refreshing else { return }
         refreshing = true
         defer { refreshing = false; focusCurrent() }
-        showToast("正在刷新推荐…")
-        while feed.loading {
-            do { try await Task.sleep(nanoseconds: 100_000_000) }
-            catch { return }
-        }
-        guard !Task.isCancelled else { return }
         let previous = Set(feed.items.map(\.id))
-        let replacement = DYFeedModel()
-        await replacement.loadMore(bridge)
-        guard !Task.isCancelled else { return }
+        var replacement: DYFeedModel
+        var instant = false
+        if let nb = nextBatch, !nb.items.filter({ !previous.contains($0.id) }).isEmpty {
+            // 后台早就备好了：直接换，不等网络
+            replacement = nb; instant = true
+        } else {
+            showToast("正在刷新推荐…")
+            while feed.loading {
+                do { try await Task.sleep(nanoseconds: 100_000_000) }
+                catch { return }
+            }
+            guard !Task.isCancelled else { return }
+            replacement = DYFeedModel()
+            replacement.followed = feed.followed
+            // 第一条到手就先换上，后面的在后台继续补
+            await replacement.loadMore(bridge, want: 1)
+            guard !Task.isCancelled else { return }
+        }
+        nextBatch = nil
         let fresh = replacement.items.filter { !previous.contains($0.id) }
         guard !fresh.isEmpty else {
             showToast(replacement.error ?? "暂时没有新的推荐，已保留当前视频")
@@ -900,18 +1018,42 @@ struct DouyinFeedScreen: View {
         }
         showComments = false
         scrollEndTask?.cancel(); userScrolling = false
-        preloader.clear()
+        // 钉住的第一条留着（秒开），其余释放
+        preloader.unpinAll()
         feed.reset()
         feed.items = fresh
         feed.liked.formUnion(replacement.liked)
         feed.collected.formUnion(replacement.collected)
+        feed.followed.formUnion(replacement.followed)
+        feed.hasMore = true
         resume = [:]
         currentID = fresh.first?.id
         scrollID = currentID
         lastFeedPull = Date()
         saveSession()
-        showToast("推荐已刷新")
-        DYLiveModel.log("DDREFRESH ok n=\(fresh.count) first=\(currentID ?? "-")")
+        showToast(instant ? "推荐已刷新" : "推荐已刷新，后面的继续加载…")
+        DYLiveModel.log("DDREFRESH ok n=\(fresh.count) first=\(currentID ?? "-") instant=\(instant)")
+        if fresh.count < 6 { Task { await feed.loadMore(bridge); focusCurrent() } }
+        scheduleNextBatch()
+    }
+
+    /// 看了一会儿之后，在后台悄悄把下一批拼好、第一条预加载好
+    private func scheduleNextBatch() {
+        guard nextBatch == nil, !preparingNext else { return }
+        preparingNext = true
+        Task {
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
+            defer { preparingNext = false }
+            guard nextBatch == nil, !refreshing, !feed.items.isEmpty else { return }
+            let m = DYFeedModel()
+            m.followed = feed.followed
+            await m.loadMore(bridge, want: 4)
+            let seen = Set(feed.items.map(\.id))
+            m.items.removeAll { seen.contains($0.id) }
+            guard !m.items.isEmpty else { return }
+            nextBatch = m
+            if let first = m.items.first { preloader.warm(first) }
+        }
     }
 
     private func focusCurrent() {
@@ -1077,7 +1219,9 @@ struct DouyinFeedScreen: View {
                                         preloader: preloader,
                                         bridge: bridge,
                                         onToast: { showToast($0) },
-                                        onDislike: { dislike(item.id) })
+                                        onDislike: { dislike(item.id) },
+                                        followed: item.author.secUid.map { feed.followed.contains($0) } ?? false,
+                                        onFollow: { follow(item.author) })
                             .containerRelativeFrame([.horizontal, .vertical])
                             .id(item.id)
                         }
@@ -1121,6 +1265,28 @@ struct DouyinFeedScreen: View {
 
     /// 点赞：先本地乐观更新，再调抖音网页接口，按服务端返回决定成败
     /// （不用 cookie 判断登录态：sessionid 是 HttpOnly，document.cookie 读不到，会误判成未登录）
+    /// 关注作者：先把加号收起来，后台告诉抖音；没登录就提示并恢复
+    private func follow(_ author: DYAweme.Author) {
+        guard let sec = author.secUid else { return }
+        feed.followed.insert(sec)
+        Task {
+            do {
+                switch try await bridge.follow(sec, follow: true) {
+                case .ok: showToast("已关注 \(author.name)")
+                case .notLoggedIn:
+                    feed.followed.remove(sec)
+                    showToast("抖音未登录：菜单 → 网页版 / 登录")
+                case .failed(let why):
+                    feed.followed.remove(sec)
+                    showToast("关注失败：\(why)")
+                }
+            } catch {
+                feed.followed.remove(sec)
+                showToast("关注失败：\(error.localizedDescription)")
+            }
+        }
+    }
+
     private func toggleLike(_ id: String, force: Bool?) {
         let has = feed.liked.contains(id)
         let want = force ?? !has
@@ -1157,6 +1323,7 @@ struct DouyinFeedScreen: View {
     /// 不感兴趣：立刻从列表拿掉并切到下一条，后台告诉抖音（失败只提示，不把视频塞回来）
     private func dislike(_ id: String) {
         guard let i = feed.items.firstIndex(where: { $0.id == id }) else { return }
+        let item = feed.items[i]
         let next = i + 1 < feed.items.count ? feed.items[i + 1].id : (i > 0 ? feed.items[i - 1].id : nil)
         scrollEndTask?.cancel(); userScrolling = false
         showComments = false
@@ -1165,6 +1332,12 @@ struct DouyinFeedScreen: View {
         resume[id] = nil
         saveSession()
         showToast("将减少此类推荐")
+        if isolation {
+            // 隔离模式：只在本地拉黑这个作者，不告诉抖音
+            if let sec = item.author.secUid { DYTaste.blockedAuthors.insert(sec) }
+            Task { await DYVideoCache.shared.markWatched(id) }
+            return
+        }
         Task {
             await DYVideoCache.shared.markWatched(id)
             do {
@@ -1226,7 +1399,13 @@ struct DouyinFeedScreen: View {
                 Task { await refreshRecommendations() }
             }
             .disabled(refreshing)
-            Toggle(isOn: $feed.portraitOnly) { Label("只看竖屏", systemImage: "rectangle.portrait") }
+            Picker(selection: $feed.portraitMode) {
+                Text("全部").tag(0)
+                Text("竖屏优先").tag(1)
+                Text("只看竖屏").tag(2)
+            } label: { Label("竖屏模式", systemImage: "rectangle.portrait") }
+            .pickerStyle(.menu)
+            Toggle(isOn: $isolation) { Label("隔离模式（不影响手机抖音推荐）", systemImage: "lock.shield") }
             Toggle(isOn: $feed.autoFit) { Label("自动铺满宽度", systemImage: "arrow.up.left.and.arrow.down.right") }
             // 弹幕开关已去掉（用户不要弹幕）
             Toggle(isOn: $deferBottomGesture) { Label("防误触（底边上滑先拖进度条）", systemImage: "hand.raised") }
@@ -1237,19 +1416,7 @@ struct DouyinFeedScreen: View {
                 Text("100 条").tag(100)
             } label: { Label("预缓存视频", systemImage: "arrow.down.circle") }
             .pickerStyle(.menu)
-            Button("清除视频缓存", systemImage: "trash") {
-                Task {
-                    let b = await DYVideoCache.shared.clear()
-                    showToast("已清除 \(b / 1024 / 1024) MB")
-                    focusCurrent()
-                }
-            }
             Button("网页版 / 登录", systemImage: "safari") { web = DYWebTarget(url: DouyinWeb.home) }
-            if let cur = current {
-                ShareLink(item: cur.webURL) { Label("分享链接", systemImage: "square.and.arrow.up") }
-            }
-            // 折叠屏适配用：把当前屏幕的逻辑尺寸、缩放、安全区、方向读出来，内屏/外屏 × 横/竖各截一次图
-            Button("屏幕信息", systemImage: "ruler") { screenInfo = Self.screenInfoText(insets: insets); showScreenInfo = true }
         } label: {
             Image(systemName: "line.3.horizontal")
                 .font(.system(size: theme.typography.pointSize(.headline), weight: .semibold))
@@ -1259,10 +1426,6 @@ struct DouyinFeedScreen: View {
                 .themeShadow(.mediaLabel)
         }
         .accessibilityLabel("抖音菜单")
-        .alert("屏幕信息", isPresented: $showScreenInfo) {
-            Button("复制") { UIPasteboard.general.string = screenInfo }
-            Button("好", role: .cancel) {}
-        } message: { Text(screenInfo) }
     }
 
     static func screenInfoText(insets: EdgeInsets) -> String {
@@ -1293,12 +1456,13 @@ struct DouyinFeedScreen: View {
 
 struct DYWebTarget: Identifiable { let id = UUID(); let url: URL }
 
-enum DYTab: CaseIterable { case follow, recommend, live
+enum DYTab: CaseIterable { case follow, recommend, live, messages
     var title: String {
         switch self {
         case .follow: "关注"
         case .recommend: "推荐"
         case .live: "直播"
+        case .messages: "消息"
         }
     }
 }
@@ -1680,6 +1844,9 @@ struct DYVideoPage: View {
     let onToast: ((String) -> Void)?
     /// 只有推荐流传：关注 / 搜索 / 我的 里不显示「不感兴趣」
     let onDislike: (() -> Void)?
+    /// 是否已关注该作者；点加号关注
+    let followed: Bool
+    let onFollow: (() -> Void)?
     @State private var heart = false
     @State private var descExpanded = false
     @State private var danmaku: [DYDanmaku] = []
@@ -1696,7 +1863,8 @@ struct DYVideoPage: View {
          onLike: @escaping () -> Void, onCollect: @escaping () -> Void, onDoubleTap: @escaping () -> Void,
          onComments: @escaping () -> Void, onAuthor: @escaping () -> Void, onSavePosition: @escaping (Double) -> Void,
          preloader: DYPreloader, bridge: DouyinBridge? = nil, onToast: ((String) -> Void)? = nil,
-         onDislike: (() -> Void)? = nil) {
+         onDislike: (() -> Void)? = nil, followed: Bool = false, onFollow: (() -> Void)? = nil) {
+        self.followed = followed; self.onFollow = onFollow
         self.item = item; self.isCurrent = isCurrent; self.insets = insets; self.resume = resume
         self.liked = liked; self.collected = collected
         self.onLike = onLike; self.onCollect = onCollect; self.onDoubleTap = onDoubleTap
@@ -1871,6 +2039,21 @@ struct DYVideoPage: View {
             }
             .buttonStyle(.plain)
             .accessibilityIdentifier("douyin.author")
+            // 抖音同款：未关注在头像下面挂个红色加号，点一下关注；已关注不显示
+            .overlay(alignment: .bottom) {
+                if !followed, let onFollow {
+                    Button(action: onFollow) {
+                        Image(systemName: "plus")
+                            .font(.system(size: 12, weight: .bold)).foregroundStyle(.white)
+                            .frame(width: 20, height: 20)
+                            .background(Circle().fill(theme.status.danger.color(for: scheme)))
+                    }
+                    .buttonStyle(.plain)
+                    .offset(y: 10)
+                    .accessibilityIdentifier("douyin.follow")
+                }
+            }
+            .padding(.bottom, followed ? 0 : 8)
             action(liked ? "heart.fill" : "heart", DYFormat.count(item.stats.digg + (liked ? 1 : 0)),
                    tint: liked ? theme.status.danger.color(for: scheme) : fg, "douyin.like", onLike)
             action("ellipsis.message.fill", DYFormat.count(item.stats.comment), tint: fg, "douyin.comments", onComments)
