@@ -993,7 +993,7 @@ struct DouyinFeedScreen: View {
             // 到底看门狗：滑到最后一条还没下一批时，每 2 秒自动补拉，不受节流（之前到底就卡死的根源）
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
-                guard tab == .recommend, !refreshing, !feed.loading, let i = currentIndex, feed.items.count - i - 1 <= 1 else { continue }
+                guard tab == .recommend, !refreshing, !feed.loading, let i = currentIndex, feed.items.count - i - 1 < 4 else { continue }
                 await feed.loadMore(bridge)
                 focusCurrent()
             }
@@ -1150,9 +1150,9 @@ struct DouyinFeedScreen: View {
             await DYVideoCache.shared.markWatched(curID)
             await DYVideoCache.shared.enqueue(ahead)
         }
-        // 后面不足「缓存条数」就继续拉推荐（至少保证 6 条，节流 4 秒一次）
-        let want = max(6, min(DYVideoCache.limit, 60))
-        if feed.items.count - i - 1 < want, Date().timeIntervalSince(lastFeedPull) > 4 {
+        // 后面永远保持至少 10 条备着（不够就拉；节流 1.5 秒一次），下一条才来得及预加载
+        let want = max(10, min(DYVideoCache.limit, 60))
+        if feed.items.count - i - 1 < want, Date().timeIntervalSince(lastFeedPull) > 1.5 {
             lastFeedPull = Date()
             Task {
                 await feed.loadMore(bridge)
