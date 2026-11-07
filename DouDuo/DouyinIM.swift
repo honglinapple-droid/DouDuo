@@ -140,6 +140,64 @@ private enum DYIMJS {
     return JSON.stringify({ ok: sent });
     """#
 
+    /// 在第 box 个消息框上唤出网页的右键菜单（回复 / 分享 / 多选 / 下载 / 撤回 / 删除 + 快捷表情）
+    static let menuHelpers = helpers + #"""
+    const boxAt = i => { const l = document.querySelector('.messageMessageListlist'); const bs = l ? [...l.querySelectorAll('.messageMessageBoxmessageBox')] : []; return bs[i]; };
+    const ctx = el => { const r = el.getBoundingClientRect(); const o = { bubbles: true, cancelable: true, clientX: r.x + 10, clientY: r.y + 10, button: 2, buttons: 2, pointerId: 1 };
+      for (const t of ['pointerdown', 'mousedown']) el.dispatchEvent(new (t.startsWith('pointer') ? PointerEvent : MouseEvent)(t, o));
+      el.dispatchEvent(new MouseEvent('contextmenu', o));
+      for (const t of ['pointerup', 'mouseup']) el.dispatchEvent(new (t.startsWith('pointer') ? PointerEvent : MouseEvent)(t, o)); };
+    const openMenu = async i => { const b = boxAt(i); if (!b) return null; const c = b.querySelector('.MessageBoxContentactiveClickArea') || b.querySelector('.messageMessageBoxcontentBox') || b;
+      ctx(c); for (let k = 0; k < 10; k++) { await sleep(80); if (document.querySelector('.MessageOperatePopBodycontainer')) break; }
+      return document.querySelector('.MessageOperatePopBodycontainer'); };
+    const closeMenu = () => document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+    const confirmDialog = async () => { for (let k = 0; k < 10; k++) { await sleep(120);
+      const btn = [...document.querySelectorAll('button, div[role=button], span')].find(e => e.childElementCount <= 1 && /^(确定|确认|撤回|删除)$/.test(txt(e)) && e.closest('[class*=modal], [class*=Modal], [class*=dialog], [class*=Dialog], [class*=confirm], [class*=Confirm]'));
+      if (btn) { fire(btn); return true; } } return false; };
+    """#
+
+    /// 读菜单：有哪些动作、有哪些快捷表情
+    static let menuInfo = menuHelpers + #"""
+    const m = await openMenu(box);
+    if (!m) return JSON.stringify({ ok: false });
+    const items = [...m.querySelectorAll('.MessageOperatePopBodydesc')].map(txt);
+    const emojis = [...m.querySelectorAll('.PopBodyEmojiQuickReplyemojiCell')].map(x => { const i = x.querySelector('img'); return (i && (i.alt || i.title)) || txt(x) || ''; });
+    closeMenu();
+    return JSON.stringify({ ok: true, items, emojis });
+    """#
+
+    /// 执行菜单动作（action = 回复 / 撤回 / 删除 …），撤回删除会自动点确认
+    static let menuAction = menuHelpers + #"""
+    const m = await openMenu(box);
+    if (!m) return JSON.stringify({ ok: false, why: 'no-menu' });
+    const it = [...m.querySelectorAll('.MessageOperatePopBodybuttonItem')].find(x => txt(x.querySelector('.MessageOperatePopBodydesc')) === action);
+    if (!it) { closeMenu(); return JSON.stringify({ ok: false, why: 'no-item' }); }
+    fire(it);
+    let confirmed = false;
+    if (action === '撤回' || action === '删除') confirmed = await confirmDialog();
+    await sleep(300);
+    return JSON.stringify({ ok: true, confirmed, reference: txt(document.querySelector('.MsgInputReferencewrapper')) });
+    """#
+
+    /// 快捷表情回复：点菜单里第 idx 个表情
+    static let quickEmoji = menuHelpers + #"""
+    const m = await openMenu(box);
+    if (!m) return JSON.stringify({ ok: false, why: 'no-menu' });
+    const cells = [...m.querySelectorAll('.PopBodyEmojiQuickReplyemojiCell')];
+    if (!cells[idx]) { closeMenu(); return JSON.stringify({ ok: false, why: 'no-emoji' }); }
+    fire(cells[idx]);
+    await sleep(500);
+    closeMenu();
+    return JSON.stringify({ ok: true });
+    """#
+
+    /// 取消回复
+    static let replyCancel = helpers + #"""
+    const c = document.querySelector('.MsgInputReferenceclose'); fire(c);
+    await sleep(200);
+    return JSON.stringify({ ok: !document.querySelector('.MsgInputReferencewrapper') });
+    """#
+
     /// 点开第 box 个消息框里的视频卡片，网页会弹出播放窗并把视频 id 写进地址栏；读到 id 就关掉
     static let openCard = helpers + #"""
     const list = document.querySelector('.messageMessageListlist');
@@ -379,9 +437,52 @@ final class DYIMModel: ObservableObject {
         guard !t.isEmpty else { return false }
         do {
             let r = try await web.eval(DYIMJS.send, ["text": t], as: OKResp.self)
-            if r.ok { await refreshMessages() }
+            if r.ok { replyingTo = nil; await refreshMessages() }
             return r.ok
         } catch { return false }
+    }
+
+    private struct MenuInfo: Decodable { let ok: Bool; let items: [String]?; let emojis: [String]? }
+    private struct ActionResp: Decodable { let ok: Bool; let confirmed: Bool?; let reference: String?; let why: String? }
+    @Published var replyingTo: String?     // 正在回复的那条的摘要（网页的引用栏文字）
+    @Published var quickEmojis: [String] = ["[微笑]", "[色]", "[发呆]", "[酷拽]", "[抠鼻]"]
+
+    /// 长按某条消息：问网页这条能做什么
+    func menu(for m: DYIMMessage) async -> [String] {
+        guard let r = try? await web.eval(DYIMJS.menuInfo, ["box": m.box], as: MenuInfo.self), r.ok else { return [] }
+        if let e = r.emojis, !e.isEmpty { quickEmojis = e }
+        return r.items ?? []
+    }
+
+    /// 回复 / 撤回 / 删除（撤回删除网页会弹确认，脚本自动点确定）
+    func act(_ action: String, on m: DYIMMessage) async -> Bool {
+        guard let r = try? await web.eval(DYIMJS.menuAction, ["box": m.box, "action": action], as: ActionResp.self), r.ok else { return false }
+        if action == "回复" { replyingTo = (r.reference ?? "").replacingOccurrences(of: "\n", with: " ") }
+        else { await refreshMessages() }
+        return true
+    }
+
+    func cancelReply() async {
+        _ = try? await web.eval(DYIMJS.replyCancel, as: ActionResp.self)
+        replyingTo = nil
+    }
+
+    func quickEmoji(_ idx: Int, on m: DYIMMessage) async -> Bool {
+        guard let r = try? await web.eval(DYIMJS.quickEmoji, ["box": m.box, "idx": idx], as: ActionResp.self), r.ok else { return false }
+        await refreshMessages()
+        return true
+    }
+
+    /// 转发给朋友：打开那个人的会话，把内容当消息发出去（视频发的是链接，抖音会显示成视频卡片）
+    func sendTo(_ c: DYIMConversation, text: String) async -> Bool {
+        guard await ensurePanel() else { return false }
+        guard let r = try? await web.eval(DYIMJS.open, ["name": c.name, "index": c.index], as: OKResp.self), r.ok else { return false }
+        let ok = await send(text)
+        if let name = openName, name != c.name {
+            // 回到用户原来开着的会话
+            _ = try? await web.eval(DYIMJS.open, ["name": name, "index": -1], as: OKResp.self)
+        }
+        return ok
     }
 
     /// 点聊天里的视频卡片：让网页点开它拿到视频 id，再用签名页取详情，交给原生播放器
@@ -516,6 +617,9 @@ struct DYChatScreen: View {
     @State private var opening: Int?
     @State private var play: DYListTarget?
     @State private var toast: String?
+    @State private var menuFor: DYIMMessage?
+    @State private var menuItems: [String] = []
+    @State private var forwardText: String?
     @FocusState private var focused: Bool
 
     var body: some View {
@@ -545,6 +649,16 @@ struct DYChatScreen: View {
                 .onAppear { DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { proxy.scrollTo("bottom", anchor: .bottom) } }
             }
 
+            if let ref = im.replyingTo {
+                HStack(spacing: 8) {
+                    Rectangle().fill(dyRed).frame(width: 3, height: 28)
+                    Text(ref.isEmpty ? "回复消息" : ref).font(.footnote).foregroundStyle(.white.opacity(0.75)).lineLimit(2)
+                    Spacer()
+                    Button { Task { await im.cancelReply() } } label: { Image(systemName: "xmark").font(.caption.weight(.bold)).foregroundStyle(.white.opacity(0.6)).frame(width: 28, height: 28) }
+                        .buttonStyle(.plain)
+                }
+                .padding(.horizontal, 14).padding(.top, 6)
+            }
             HStack(spacing: 10) {
                 TextField("发送消息", text: $draft, axis: .vertical).lineLimit(1...4)
                     .focused($focused)
@@ -571,6 +685,27 @@ struct DYChatScreen: View {
             }
         }
         .alert("发送失败，再试一次", isPresented: $failed) { Button("好", role: .cancel) {} }
+        .sheet(item: $menuFor) { m in
+            DYMessageMenu(message: m, items: menuItems, emojis: im.quickEmojis,
+                          onEmoji: { i in menuFor = nil; Task { if !(await im.quickEmoji(i, on: m)) { show("没发出去") } } },
+                          onAction: { a in
+                              menuFor = nil
+                              switch a {
+                              case "转发": forwardText = m.kind == .text ? m.text : nil; if forwardText == nil { Task { if let v = await im.openCard(m) { forwardText = v.webURL.absoluteString } else { show("这条不能转发") } } }
+                              default: Task { if await im.act(a, on: m) { if a != "回复" { show("已\(a)") } } else { show("没成功") } }
+                              }
+                          })
+            .presentationDetents([.height(m.fromMe ? 300 : 260)])
+            .presentationBackground(Color(red: 0.12, green: 0.12, blue: 0.13))
+        }
+        .sheet(isPresented: Binding(get: { forwardText != nil }, set: { if !$0 { forwardText = nil } })) {
+            DYFriendPicker(im: im, title: "转发给朋友") { friend in
+                let text = forwardText ?? ""; forwardText = nil
+                Task { if await im.sendTo(friend, text: text) { show("已发给 \(friend.name)") } else { show("没发出去") } }
+            }
+            .presentationDetents([.medium, .large])
+            .presentationBackground(Color(red: 0.12, green: 0.12, blue: 0.13))
+        }
         .fullScreenCover(item: $play) { t in
             DYListPlayer(bridge: bridge, title: t.title, items: t.items, start: t.start, loadMore: nil, onAuthor: onAuthor)
         }
@@ -585,6 +720,18 @@ struct DYChatScreen: View {
         let ok = await im.send(t)
         sending = false
         if ok { draft = "" } else { failed = true }
+    }
+
+    private func show(_ s: String) {
+        toast = s
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { if toast == s { toast = nil } }
+    }
+
+    private func longPress(_ m: DYIMMessage) {
+        guard m.kind != .time else { return }
+        menuItems = []
+        menuFor = m
+        Task { let items = await im.menu(for: m); if menuFor == m { menuItems = items } }
     }
 
     private func openCard(_ m: DYIMMessage) {
@@ -606,6 +753,7 @@ struct DYChatScreen: View {
             HStack(alignment: .top, spacing: 8) {
                 if m.fromMe { Spacer(minLength: 50) } else { avatar(m.avatar ?? conversation.avatar, size: 36) }
                 content(m)
+                    .onLongPressGesture(minimumDuration: 0.35) { longPress(m) }
                 if !m.fromMe { Spacer(minLength: 50) }
             }
         }
@@ -649,6 +797,118 @@ struct DYChatScreen: View {
                 .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(m.fromMe ? dyRed : dyBubble))
                 .textSelection(.enabled)
         }
+    }
+}
+
+/// 长按消息弹出的菜单（照抖音：一排快捷表情 + 回复 / 转发 / 撤回 / 删除）
+struct DYMessageMenu: View {
+    let message: DYIMMessage
+    let items: [String]
+    let emojis: [String]
+    let onEmoji: (Int) -> Void
+    let onAction: (String) -> Void
+
+    private var actions: [String] {
+        var out = ["回复", "转发"]
+        if message.fromMe { out.append("撤回") }
+        out.append("删除")
+        // 网页说没有的就不显示（比如对方的消息没有撤回）
+        return out.filter { $0 == "转发" || items.isEmpty || items.contains($0) }
+    }
+
+    var body: some View {
+        VStack(spacing: 14) {
+            Capsule().fill(.white.opacity(0.25)).frame(width: 36, height: 4).padding(.top, 8)
+            HStack(spacing: 14) {
+                ForEach(Array(emojis.prefix(6).enumerated()), id: \.offset) { i, e in
+                    Button { onEmoji(i) } label: {
+                        Text(DYEmoji.glyph(e)).font(.system(size: 30)).frame(width: 46, height: 46)
+                            .background(Circle().fill(.white.opacity(0.08)))
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+            VStack(spacing: 0) {
+                ForEach(actions, id: \.self) { a in
+                    Button { onAction(a) } label: {
+                        HStack {
+                            Image(systemName: a == "回复" ? "arrowshape.turn.up.left" : a == "转发" ? "arrowshape.turn.up.right" : a == "撤回" ? "arrow.uturn.backward" : "trash")
+                                .frame(width: 24)
+                            Text(a)
+                            Spacer()
+                        }
+                        .font(.body).foregroundStyle(a == "删除" || a == "撤回" ? Color(red: 1, green: 0.35, blue: 0.35) : .white)
+                        .padding(.horizontal, 20).frame(height: 46).contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    if a != actions.last { Divider().overlay(.white.opacity(0.08)).padding(.leading, 56) }
+                }
+            }
+            Spacer(minLength: 0)
+        }
+    }
+}
+
+/// 抖音的 [微笑] 这类表情代码 → 对应的表情符号（显示用；发出去的是抖音自己的表情）
+enum DYEmoji {
+    static let map: [String: String] = ["[微笑]": "🙂", "[色]": "😍", "[发呆]": "😳", "[酷拽]": "😎", "[抠鼻]": "🤔", "[捂脸]": "🤦", "[大笑]": "😆", "[流泪]": "😭", "[呲牙]": "😁", "[偷笑]": "🤭", "[可爱]": "😊", "[害羞]": "☺️", "[抓狂]": "😫", "[点赞]": "👍", "[比心]": "🫶", "[666]": "6️⃣", "[泣不成声]": "😢", "[震惊]": "😱", "[爱心]": "❤️", "[鼓掌]": "👏"]
+    static func glyph(_ code: String) -> String { map[code] ?? code.replacingOccurrences(of: "[", with: "").replacingOccurrences(of: "]", with: "") }
+}
+
+/// 选一个朋友（转发 / 分享视频用）
+struct DYFriendPicker: View {
+    @ObservedObject var im: DYIMModel
+    let title: String
+    let onPick: (DYIMConversation) -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var query = ""
+
+    private var rows: [DYIMConversation] {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        return q.isEmpty ? im.conversations : im.conversations.filter { $0.name.localizedCaseInsensitiveContains(q) }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Button("取消") { dismiss() }.foregroundStyle(.white.opacity(0.7))
+                Spacer()
+                Text(title).font(.headline).foregroundStyle(.white)
+                Spacer()
+                Color.clear.frame(width: 40)
+            }
+            .padding(.horizontal, 16).padding(.vertical, 12)
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass").foregroundStyle(.white.opacity(0.5))
+                TextField("搜索朋友", text: $query).foregroundStyle(.white).textInputAutocapitalization(.never)
+            }
+            .padding(.horizontal, 12).frame(height: 36)
+            .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(0.08)))
+            .padding(.horizontal, 16).padding(.bottom, 8)
+            if rows.isEmpty {
+                Text(im.conversations.isEmpty ? "还没读到朋友列表，先打开一次「消息」" : "没找到").font(.footnote).foregroundStyle(.white.opacity(0.6)).padding(.top, 30)
+                Spacer()
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(rows) { c in
+                            Button { dismiss(); onPick(c) } label: {
+                                HStack(spacing: 12) {
+                                    avatar(c.avatar, size: 44)
+                                    Text(c.name).font(.subheadline.weight(.semibold)).foregroundStyle(.white).lineLimit(1)
+                                    Spacer()
+                                    Text("发送").font(.footnote.weight(.semibold)).foregroundStyle(.white)
+                                        .padding(.horizontal, 14).frame(height: 30).background(Capsule().fill(dyRed))
+                                }
+                                .padding(.horizontal, 16).padding(.vertical, 8).contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+            }
+        }
+        .onAppear { im.start(); if im.conversations.isEmpty { Task { await im.refreshList() } } }
     }
 }
 

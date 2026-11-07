@@ -822,6 +822,7 @@ struct DouyinFeedScreen: View {
     @AppStorage("douyin_danmaku_v2") private var danmakuOn = false
     @State private var showMine = false
     @State private var showMessages = false
+    @State private var shareTarget: DYAweme?
     @StateObject private var im = DYIMModel()
     @State private var authorTarget: DYAweme.Author?
 
@@ -1131,6 +1132,13 @@ struct DouyinFeedScreen: View {
         .fullScreenCover(isPresented: $showSearch) {
             DYSearchScreen(bridge: bridge, onAuthor: { a in authorTarget = a.author })
         }
+        .sheet(item: $shareTarget) { a in
+            DYFriendPicker(im: im, title: "发送给朋友") { friend in
+                Task { if await im.sendTo(friend, text: a.webURL.absoluteString) { showToast("已发给 \(friend.name)") } else { showToast("没发出去，看看是否已登录") } }
+            }
+            .presentationDetents([.medium, .large])
+            .presentationBackground(Color(red: 0.12, green: 0.12, blue: 0.13))
+        }
         .fullScreenCover(isPresented: $showMessages) {
             DYMessagesScreen(im: im, bridge: bridge, onClose: { showMessages = false },
                              onLogin: { showMessages = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { web = DYWebTarget(url: DouyinWeb.home) } },
@@ -1248,7 +1256,8 @@ struct DouyinFeedScreen: View {
                                         onToast: { showToast($0) },
                                         onDislike: { dislike(item.id) },
                                         followed: item.author.secUid.map { feed.followed.contains($0) } ?? false,
-                                        onFollow: { follow(item.author) })
+                                        onFollow: { follow(item.author) },
+                                        onShare: { shareTarget = item })
                             .containerRelativeFrame([.horizontal, .vertical])
                             .id(item.id)
                         }
@@ -1874,6 +1883,8 @@ struct DYVideoPage: View {
     /// 是否已关注该作者；点加号关注
     let followed: Bool
     let onFollow: (() -> Void)?
+    /// 分享给朋友（nil = 用系统分享）
+    let onShare: (() -> Void)?
     @State private var heart = false
     @State private var descExpanded = false
     @State private var danmaku: [DYDanmaku] = []
@@ -1890,8 +1901,8 @@ struct DYVideoPage: View {
          onLike: @escaping () -> Void, onCollect: @escaping () -> Void, onDoubleTap: @escaping () -> Void,
          onComments: @escaping () -> Void, onAuthor: @escaping () -> Void, onSavePosition: @escaping (Double) -> Void,
          preloader: DYPreloader, bridge: DouyinBridge? = nil, onToast: ((String) -> Void)? = nil,
-         onDislike: (() -> Void)? = nil, followed: Bool = false, onFollow: (() -> Void)? = nil) {
-        self.followed = followed; self.onFollow = onFollow
+         onDislike: (() -> Void)? = nil, followed: Bool = false, onFollow: (() -> Void)? = nil, onShare: (() -> Void)? = nil) {
+        self.followed = followed; self.onFollow = onFollow; self.onShare = onShare
         self.item = item; self.isCurrent = isCurrent; self.insets = insets; self.resume = resume
         self.liked = liked; self.collected = collected
         self.onLike = onLike; self.onCollect = onCollect; self.onDoubleTap = onDoubleTap
@@ -2091,12 +2102,17 @@ struct DYVideoPage: View {
             if let onDislike {
                 action("hand.thumbsdown", "不感兴趣", tint: fg, "douyin.dislike", onDislike)
             }
-            ShareLink(item: item.webURL) {
-                VStack(spacing: 3) {
-                    Image(systemName: "arrowshape.turn.up.right.fill").font(.system(size: theme.typography.pointSize(.displayLarge)))
-                    Text(DYFormat.count(item.stats.share)).font(.caption2.weight(.semibold))
+            // 分享：直接选朋友发过去（抖音同款），不走系统分享菜单
+            if let onShare {
+                action("arrowshape.turn.up.right.fill", DYFormat.count(item.stats.share), tint: fg, "douyin.share") { onShare() }
+            } else {
+                ShareLink(item: item.webURL) {
+                    VStack(spacing: 3) {
+                        Image(systemName: "arrowshape.turn.up.right.fill").font(.system(size: theme.typography.pointSize(.displayLarge)))
+                        Text(DYFormat.count(item.stats.share)).font(.caption2.weight(.semibold))
+                    }
+                    .foregroundStyle(fg)
                 }
-                .foregroundStyle(fg)
             }
             // 保存按钮已按用户要求去掉（2026-11-07）
         }
