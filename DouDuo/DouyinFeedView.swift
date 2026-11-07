@@ -866,9 +866,9 @@ struct DouyinFeedScreen: View {
             try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
             try? AVAudioSession.sharedInstance().setActive(true)
             im.attach(bridge)
-            DYEmojiStore.shared.load(bridge)
-            // 消息用自己的后台网页，不占签名页；晚 2 秒起，先让第一条视频起来
-            Task { try? await Task.sleep(nanoseconds: 2_000_000_000); im.start() }
+            Task { try? await Task.sleep(nanoseconds: 10_000_000_000); DYEmojiStore.shared.load(bridge) }
+            // 消息用自己的后台网页，不占签名页；晚 6 秒起，先让第一条视频起来（冷启动黑屏久）
+            Task { try? await Task.sleep(nanoseconds: 6_000_000_000); im.start() }
             #if DEBUG
             if ProcessInfo.processInfo.environment["DOUDUO_SELFTEST"] == "1" { Task { await DDSelfTest.run(bridge) } }
             if ProcessInfo.processInfo.environment["DOUDUO_APITEST"] == "1" { Task { await DDApiProbe.run(bridge) } }
@@ -2190,15 +2190,15 @@ struct DYCommentPanel: View {
                 if let onClose {
                     // 关闭按钮原来只有图标那么大（约 14pt），很难点中；扩成 44×44 的可点区域
                     Button(action: onClose) {
-                        Image(systemName: "xmark").font(.subheadline.weight(.semibold))
-                            .frame(width: 44, height: 44).contentShape(Rectangle())
+                        Image(systemName: "xmark").font(.headline.weight(.semibold))
+                            .frame(width: 52, height: 44).contentShape(Rectangle())
                     }
                     .buttonStyle(.plain)
                     .accessibilityLabel("关闭评论")
                 }
             }
             .foregroundStyle(.themeTextPrimary)
-            .padding(.horizontal, 16).padding(.vertical, 12)
+            .padding(.leading, 16).padding(.trailing, 4).padding(.vertical, 6)
             Divider()
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 16) {

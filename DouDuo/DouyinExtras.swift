@@ -556,6 +556,9 @@ struct DYListPlayer: View {
 
     var body: some View {
         GeometryReader { geo in
+            // 和推荐页一样：Duo 内屏（短边 >= 600）横竖都左右分屏放评论，外屏从底部弹出
+            let wide = min(geo.size.width, geo.size.height) >= 600
+            HStack(spacing: 0) {
             ZStack(alignment: .topLeading) {
                 Color.black.ignoresSafeArea()
                 ScrollView(.vertical) {
@@ -598,11 +601,18 @@ struct DYListPlayer: View {
                         .allowsHitTesting(false)
                 }
             }
-            .sheet(isPresented: $showComments) {
+            .sheet(isPresented: Binding(get: { showComments && !wide }, set: { showComments = $0 })) {
                 if let cur = current {
                     DYCommentPanel(bridge: bridge, aweme: cur, onClose: { showComments = false })
                         .presentationDetents([.fraction(0.62), .large])
                 }
+            }
+            if wide && showComments, let cur = current {
+                DYCommentPanel(bridge: bridge, aweme: cur, onClose: { withAnimation(.snappy) { showComments = false } })
+                    .frame(width: min(380, geo.size.width * 0.36))
+                    .id(cur.id)
+                    .transition(.move(edge: .trailing))
+            }
             }
         }
         .statusBarHidden(true)
@@ -698,6 +708,8 @@ struct DYListTarget: Identifiable {
     let items: [DYAweme]
     let start: Int
     let model: DYPagedModel?
+    /// 还没取详情的视频 id（聊天串播用，滑到后面再取）
+    var more: [String] = []
 }
 
 // MARK: - 搜索

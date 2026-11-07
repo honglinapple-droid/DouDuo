@@ -29,6 +29,8 @@ struct DYIMMessage: Identifiable, Equatable, Codable {
     let author: String?
     let cover: String?
     let avatar: String?
+    /// 分享的视频 id（有了就能直接播，不用去网页点）
+    var itemId: String? = nil
 }
 
 struct DYIMBanner: Identifiable, Equatable {
@@ -51,6 +53,15 @@ private enum DYIMJS {
     const items = () => [...document.querySelectorAll('[data-e2e=conversation-item]')];
     const loggedIn = () => !/扫码登录|验证码登录|登录后免费/.test(document.body.innerText);
     const closeModal = () => { if (/modal_id=/.test(location.href)) { history.back(); } document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); };
+    const fk = el => Object.keys(el).find(k => k.startsWith('__reactFiber'));
+    // 网页的输入框是 editor-kit，往 DOM 里填字它不认；要拿到它的编辑器实例调 setText
+    const getEditor = () => { const root = document.querySelector('.messageEditorimChatEditorContainer'); if (!root) return null; let f = root[fk(root)];
+      for (let i = 0; i < 6 && f; i++) { if (f.memoizedProps && f.memoizedProps.onInitEditor) { let h = f.memoizedState; while (h) { const c = h.memoizedState && h.memoizedState.current; if (c && typeof c.setText === 'function') return c; h = h.next; } } f = f.return; } return null; };
+    // 每条消息框对应的结构化数据（React 里的 message.parsedContent：视频 id、标题、封面）
+    const msgOf = b => { let f = b[fk(b)]; for (let i = 0; i < 14 && f; i++) { const m = f.memoizedProps && f.memoizedProps.message; if (m && m.parsedContent !== undefined) return m; f = f.return; }
+      let stack = [b[fk(b)]], n = 0; while (stack.length && n < 300) { const x = stack.pop(); if (!x) continue; n++; const m = x.memoizedProps && x.memoizedProps.message; if (m && m.parsedContent !== undefined) return m; if (x.child) stack.push(x.child); if (x.sibling) stack.push(x.sibling); } return null; };
+    const idxOf = b => { let e = b; for (let i = 0; i < 3 && e; i++) { const v = e.getAttribute && e.getAttribute('data-index'); if (v != null) return parseInt(v, 10); e = e.parentElement; } return -1; };
+    const boxesNewestFirst = () => { const l = document.querySelector('.messageMessageListlist'); return l ? [...l.querySelectorAll('.messageMessageBoxmessageBox')] : []; };
     """#
 
     static let ensureOpen = helpers + #"""
@@ -93,9 +104,12 @@ private enum DYIMJS {
     static let messages = helpers + #"""
     const list = document.querySelector('.messageMessageListlist');
     if (!list) return JSON.stringify({ title: '', msgs: [] });
-    const boxes = [...list.querySelectorAll('.messageMessageBoxmessageBox')];
+    // 网页列表是倒着排的（最新在最上、data-index 0），这里按 data-index 从大到小 = 从旧到新
+    const boxes = boxesNewestFirst().map(b => ({ b, i: idxOf(b) })).sort((x, y) => y.i - x.i).map(x => x.b);
     const flat = [];
-    boxes.forEach((b, i) => {
+    boxes.forEach((b, k) => {
+      const i = idxOf(b) >= 0 ? idxOf(b) : k;
+      const pm = msgOf(b); const pc = (pm && pm.parsedContent) || {};
       const fromMe = !!b.querySelector('[class*=isFromMe]') || /isFromMe/.test(b.className);
       const time = b.querySelector('.MessageBoxTimetimeLayout');
       const t = b.querySelector('.TextMessageTextpureText');
@@ -106,43 +120,42 @@ private enum DYIMJS {
       const av = b.querySelector('.commonIMAvataravatarContainer img');
       const pick = el => { const im = el && (el.querySelector('img.commonMyImageimgReal') || el.querySelector('img')); return im ? (im.currentSrc || im.src || '') : ''; };
       let kind = 'other', text = '', author = '', cover = '';
+      let itemId = pc.itemId ? String(pc.itemId) : '';
       if (t) { kind = 'text'; text = t.innerText; }
-      else if (sh) { kind = 'share'; author = txt(sh.querySelector('.MessageItemShareAwemeauthorName')); cover = pick(sh); text = '分享了一个视频'; }
+      else if (sh) { kind = 'share'; author = txt(sh.querySelector('.MessageItemShareAwemeauthorName')) || pc.content_name || ''; cover = pick(sh) || (pc.cover_url && pc.cover_url.url_list && pc.cover_url.url_list[0]) || ''; text = (pc.content_title || '').slice(0, 60) || '分享了一个视频'; }
       else if (vid) { kind = 'video'; cover = pick(vid); text = '视频'; }
       else if (au) { kind = 'audio'; text = txt(au.querySelector('.MessageItemAudioduration')) || '语音'; }
       else if (cs) { kind = 'comment'; text = txt(cs).slice(0, 200); }
       else if (/暂不支持/.test(b.innerText)) { kind = 'unsupported'; text = '暂不支持的消息类型，请到抖音手机端查看'; }
       else { const raw = txt(b).replace(/^已读\s*/, ''); if (raw && !time) text = raw.slice(0, 200); }
       const tt = time ? txt(time) : '';
-      if (tt) flat.push({ id: i * 2, box: i, kind: 'time', fromMe: false, text: tt, author: '', cover: '', avatar: '' });
-      if (text || cover) flat.push({ id: i * 2 + 1, box: i, kind, fromMe, text, author, cover, avatar: av ? (av.currentSrc || av.src || '') : '' });
+      const key = 100000 - i;   // 让 id 随时间递增
+      if (tt) flat.push({ id: key * 2, box: i, kind: 'time', fromMe: false, text: tt, author: '', cover: '', avatar: '', itemId: '' });
+      if (text || cover) flat.push({ id: key * 2 + 1, box: i, kind, fromMe, text, author, cover, avatar: av ? (av.currentSrc || av.src || '') : '', itemId });
     });
     return JSON.stringify({ title: txt(document.querySelector('.StackLayoutStackChatHeadertitle')), msgs: flat });
     """#
 
     /// 发送：填字 → 点右下角发送钮（网页就是这么发的）→ 不行再回车
     static let send = helpers + #"""
+    const editor = getEditor();
     const ed = document.querySelector('div[contenteditable=true].messageEditorinputArea');
-    if (!ed) return JSON.stringify({ ok: false, why: 'no-editor' });
-    ed.focus();
-    document.execCommand('selectAll', false, null); document.execCommand('delete', false, null);
-    document.execCommand('insertText', false, text);
-    await sleep(120);
+    if (!editor || !ed) return JSON.stringify({ ok: false, why: 'no-editor' });
+    const top0 = boxesNewestFirst().find(x => idxOf(x) === 0); const before = top0 ? txt(top0) : '';
+    editor.focus(); editor.setText(text);
+    await sleep(200);
     const btn = document.querySelector('.messageMsgInputpublishBtn');
-    if (btn) fire(btn);
-    for (let i = 0; i < 8 && txt(ed); i++) await sleep(120);
-    if (txt(ed)) {
-      for (const t of ['keydown', 'keypress', 'keyup']) ed.dispatchEvent(new KeyboardEvent(t, { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }));
-      for (let i = 0; i < 8 && txt(ed); i++) await sleep(120);
-    }
-    const sent = !txt(ed);
-    if (!sent) { document.execCommand('selectAll', false, null); document.execCommand('delete', false, null); }
+    if (!btn) return JSON.stringify({ ok: false, why: 'no-send-btn' });
+    fire(btn);
+    let sent = false;
+    for (let i = 0; i < 15; i++) { await sleep(150); const t0 = boxesNewestFirst().find(x => idxOf(x) === 0); if (t0 && txt(t0) !== before && !txt(ed).replace(/\u200b/g, '').trim()) { sent = true; break; } }
+    if (!sent) sent = !txt(ed).replace(/\u200b/g, '').trim();
     return JSON.stringify({ ok: sent });
     """#
 
     /// 在第 box 个消息框上唤出网页的右键菜单（回复 / 分享 / 多选 / 下载 / 撤回 / 删除 + 快捷表情）
     static let menuHelpers = helpers + #"""
-    const boxAt = i => { const l = document.querySelector('.messageMessageListlist'); const bs = l ? [...l.querySelectorAll('.messageMessageBoxmessageBox')] : []; return bs[i]; };
+    const boxAt = i => boxesNewestFirst().find(b => idxOf(b) === i) || boxesNewestFirst()[i];
     const ctx = el => { const r = el.getBoundingClientRect(); const o = { bubbles: true, cancelable: true, clientX: r.x + 10, clientY: r.y + 10, button: 2, buttons: 2, pointerId: 1 };
       for (const t of ['pointerdown', 'mousedown']) el.dispatchEvent(new (t.startsWith('pointer') ? PointerEvent : MouseEvent)(t, o));
       el.dispatchEvent(new MouseEvent('contextmenu', o));
@@ -191,6 +204,29 @@ private enum DYIMJS {
     return JSON.stringify({ ok: true });
     """#
 
+    /// 把第 box 条消息转发给朋友：菜单「分享」→「选择朋友」面板里找到那个人 → 点他旁边的「发送」
+    static let forward = menuHelpers + #"""
+    const m = await openMenu(box);
+    if (!m) return JSON.stringify({ ok: false, why: 'no-menu' });
+    const it = [...m.querySelectorAll('.MessageOperatePopBodybuttonItem')].find(x => txt(x.querySelector('.MessageOperatePopBodydesc')) === '分享');
+    if (!it) { closeMenu(); return JSON.stringify({ ok: false, why: 'no-share' }); }
+    fire(it);
+    let panel = null;
+    for (let i = 0; i < 20; i++) { await sleep(150); panel = [...document.querySelectorAll('.imContainer *')].find(e => e.childElementCount === 0 && txt(e) === '选择朋友'); if (panel) break; }
+    if (!panel) return JSON.stringify({ ok: false, why: 'no-picker' });
+    let root = panel; for (let i = 0; i < 8 && root && !root.querySelector('img'); i++) root = root.parentElement;
+    const rows = [...root.querySelectorAll('*')].filter(e => e.querySelector('img') && [...e.children].length >= 2 && [...e.querySelectorAll('*')].some(x => x.childElementCount === 0 && txt(x) === '发送') && e.getBoundingClientRect().height > 36 && e.getBoundingClientRect().height < 90);
+    const row = rows.find(r => txt(r).split('\n').map(s => s.trim()).includes(name)) || rows.find(r => txt(r).includes(name));
+    if (!row) { closeMenu(); return JSON.stringify({ ok: false, why: 'no-friend', n: rows.length }); }
+    const sendBtn = [...row.querySelectorAll('*')].find(x => x.childElementCount === 0 && txt(x) === '发送');
+    fire(sendBtn);
+    await sleep(600);
+    for (let k = 0; k < 6; k++) { const c = [...document.querySelectorAll('button, div[role=button], span, div')].find(e => e.childElementCount <= 1 && txt(e) === '发送' && !root.contains(e) && e.getBoundingClientRect().width > 0 && e.closest('[class*=modal], [class*=Modal], [class*=dialog], [class*=Dialog], [class*=confirm], [class*=Confirm]')); if (c) { fire(c); break; } await sleep(150); }
+    await sleep(800);
+    closeMenu();
+    return JSON.stringify({ ok: true });
+    """#
+
     /// 取消回复
     static let replyCancel = helpers + #"""
     const c = document.querySelector('.MsgInputReferenceclose'); fire(c);
@@ -200,10 +236,9 @@ private enum DYIMJS {
 
     /// 点开第 box 个消息框里的视频卡片，网页会弹出播放窗并把视频 id 写进地址栏；读到 id 就关掉
     static let openCard = helpers + #"""
-    const list = document.querySelector('.messageMessageListlist');
-    const boxes = list ? [...list.querySelectorAll('.messageMessageBoxmessageBox')] : [];
-    const b = boxes[box];
+    const b = boxesNewestFirst().find(x => idxOf(x) === box) || boxesNewestFirst()[box];
     if (!b) return JSON.stringify({ ok: false, why: 'no-box' });
+    const pm0 = msgOf(b); if (pm0 && pm0.parsedContent && pm0.parsedContent.itemId) return JSON.stringify({ ok: true, id: String(pm0.parsedContent.itemId) });
     const icon = b.querySelector('.MessageItemShareAwemeplayIcon') || b.querySelector('.BulletBulletVideoplayIcon') || b.querySelector('.MessageItemShareAwemecontainer') || b.querySelector('.BulletBulletVideocontainer');
     if (!icon) return JSON.stringify({ ok: false, why: 'no-card' });
     fire(icon);
@@ -333,7 +368,7 @@ final class DYIMModel: ObservableObject {
     private struct ListResp: Decodable { let login: Bool; let list: [Row]
         struct Row: Decodable { let index: Int; let name: String; let last: String; let time: String; let pinned: Bool; let avatar: String; let unread: Int } }
     private struct MsgResp: Decodable { let title: String; let msgs: [Row]
-        struct Row: Decodable { let id: Int; let box: Int; let kind: String; let fromMe: Bool; let text: String; let author: String; let cover: String; let avatar: String } }
+        struct Row: Decodable { let id: Int; let box: Int; let kind: String; let fromMe: Bool; let text: String; let author: String; let cover: String; let avatar: String; let itemId: String? } }
     private struct OKResp: Decodable { let ok: Bool; let login: Bool?; let title: String?; let why: String?; let id: String? }
 
     func attach(_ b: DouyinBridge) { bridge = b }
@@ -426,7 +461,8 @@ final class DYIMModel: ObservableObject {
             let r = try await web.eval(DYIMJS.messages, as: MsgResp.self)
             guard let name = openName, r.title.isEmpty || r.title == name else { return }
             let fresh = r.msgs.map { DYIMMessage(id: $0.id, box: $0.box, kind: DYIMMessage.Kind(rawValue: $0.kind) ?? .other, fromMe: $0.fromMe, text: $0.text,
-                                                 author: $0.author.isEmpty ? nil : $0.author, cover: $0.cover.isEmpty ? nil : $0.cover, avatar: $0.avatar.isEmpty ? nil : $0.avatar) }
+                                                 author: $0.author.isEmpty ? nil : $0.author, cover: $0.cover.isEmpty ? nil : $0.cover, avatar: $0.avatar.isEmpty ? nil : $0.avatar,
+                                                 itemId: ($0.itemId ?? "").isEmpty ? nil : $0.itemId) }
             guard !fresh.isEmpty else { return }
             if fresh != messages { messages = fresh; DYIMCache.save(name, fresh) }
         } catch { self.error = error.localizedDescription }
@@ -485,14 +521,36 @@ final class DYIMModel: ObservableObject {
         return ok
     }
 
-    /// 点聊天里的视频卡片：让网页点开它拿到视频 id，再用签名页取详情，交给原生播放器
+    /// 视频详情缓存（聊天里上下滑看所有分享的视频用）
+    private var detailCache: [String: DYAweme] = [:]
+
+    func details(_ ids: [String]) async -> [DYAweme] {
+        var out: [DYAweme] = []
+        for id in ids { if let a = await detail(id) { out.append(a) } }
+        return out
+    }
+
+    func detail(_ id: String) async -> DYAweme? {
+        if let a = detailCache[id] { return a }
+        guard let bridge, let a = try? await bridge.detail(id) else { return nil }
+        detailCache[id] = a
+        return a
+    }
+
+    /// 点聊天里的视频卡片：消息里直接带着视频 id（从网页的 React 数据读的），取详情交给原生播放器
     func openCard(_ m: DYIMMessage) async -> DYAweme? {
-        guard let bridge else { return nil }
+        if let id = m.itemId { return await detail(id) }
         do {
             let r = try await web.eval(DYIMJS.openCard, ["box": m.box], as: OKResp.self)
             guard r.ok, let id = r.id, !id.isEmpty else { return nil }
-            return try await bridge.detail(id)
+            return await detail(id)
         } catch { return nil }
+    }
+
+    /// 把这条消息（视频）转发给朋友：走网页自己的「分享 → 选择朋友 → 发送」
+    func forward(_ m: DYIMMessage, to c: DYIMConversation) async -> Bool {
+        guard let r = try? await web.eval(DYIMJS.forward, ["box": m.box, "name": c.name], as: ActionResp.self) else { return false }
+        return r.ok
     }
 }
 
@@ -565,6 +623,7 @@ struct DYMessagesScreen: View {
                 }
             }
             .background(dyBG.ignoresSafeArea())
+            .gesture(DragGesture(minimumDistance: 24).onEnded { v in if v.startLocation.x < 44 && v.translation.width > 70 && abs(v.translation.height) < 80 { onClose() } })
             .navigationDestination(item: $open) { c in
                 DYChatScreen(im: im, bridge: bridge, conversation: c, onBack: { open = nil }, onAuthor: onAuthor)
             }
@@ -619,7 +678,7 @@ struct DYChatScreen: View {
     @State private var toast: String?
     @State private var menuFor: DYIMMessage?
     @State private var menuItems: [String] = []
-    @State private var forwardText: String?
+    @State private var forwardMessage: DYIMMessage?
     @FocusState private var focused: Bool
 
     var body: some View {
@@ -645,6 +704,8 @@ struct DYChatScreen: View {
                     }
                     .padding(.horizontal, 12).padding(.top, 8)
                 }
+                .scrollDismissesKeyboard(.interactively)
+                .onTapGesture { focused = false }
                 .onChange(of: im.messages.count) { _, _ in proxy.scrollTo("bottom", anchor: .bottom) }
                 .onAppear { DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { proxy.scrollTo("bottom", anchor: .bottom) } }
             }
@@ -660,12 +721,15 @@ struct DYChatScreen: View {
                 .padding(.horizontal, 14).padding(.top, 6)
             }
             HStack(spacing: 10) {
+                if focused {
+                    Button { focused = false } label: { Image(systemName: "keyboard.chevron.compact.down").foregroundStyle(.white.opacity(0.7)).frame(width: 34, height: 34) }
+                        .buttonStyle(.plain)
+                }
                 TextField("发送消息", text: $draft, axis: .vertical).lineLimit(1...4)
                     .focused($focused)
                     .foregroundStyle(.white)
                     .padding(.horizontal, 12).padding(.vertical, 8)
                     .background(RoundedRectangle(cornerRadius: 18).fill(.white.opacity(0.08)))
-                    .onSubmit { Task { await doSend() } }
                 Button { Task { await doSend() } } label: {
                     if sending { ProgressView().tint(.white).frame(width: 60, height: 34) }
                     else { Text("发送").font(.subheadline.weight(.semibold)).foregroundStyle(.white).frame(width: 60, height: 34).background(Capsule().fill(draft.trimmingCharacters(in: .whitespaces).isEmpty ? Color.white.opacity(0.15) : dyRed)) }
@@ -678,6 +742,8 @@ struct DYChatScreen: View {
         .background(dyBG.ignoresSafeArea())
         .navigationBarBackButtonHidden(true)
         .toolbar(.hidden, for: .navigationBar)
+        // 从左边缘右滑 = 返回（按钮太靠边手指不好点）
+        .gesture(DragGesture(minimumDistance: 24).onEnded { v in if v.startLocation.x < 44 && v.translation.width > 70 && abs(v.translation.height) < 80 { focused = false; onBack() } })
         .overlay(alignment: .top) {
             if let toast {
                 Text(toast).font(.footnote).foregroundStyle(.white).padding(.horizontal, 14).padding(.vertical, 8)
@@ -691,23 +757,27 @@ struct DYChatScreen: View {
                           onAction: { a in
                               menuFor = nil
                               switch a {
-                              case "转发": forwardText = m.kind == .text ? m.text : nil; if forwardText == nil { Task { if let v = await im.openCard(m) { forwardText = v.webURL.absoluteString } else { show("这条不能转发") } } }
+                              case "转发": forwardMessage = m
                               default: Task { if await im.act(a, on: m) { if a != "回复" { show("已\(a)") } } else { show("没成功") } }
                               }
                           })
             .presentationDetents([.height(m.fromMe ? 300 : 260)])
             .presentationBackground(Color(red: 0.12, green: 0.12, blue: 0.13))
         }
-        .sheet(isPresented: Binding(get: { forwardText != nil }, set: { if !$0 { forwardText = nil } })) {
+        .sheet(item: $forwardMessage) { fm in
             DYFriendPicker(im: im, title: "转发给朋友") { friend in
-                let text = forwardText ?? ""; forwardText = nil
-                Task { if await im.sendTo(friend, text: text) { show("已发给 \(friend.name)") } else { show("没发出去") } }
+                forwardMessage = nil
+                Task {
+                    let ok = fm.kind == .text ? await im.sendTo(friend, text: fm.text) : await im.forward(fm, to: friend)
+                    show(ok ? "已发给 \(friend.name)" : "没发出去")
+                }
             }
             .presentationDetents([.medium, .large])
             .presentationBackground(Color(red: 0.12, green: 0.12, blue: 0.13))
         }
         .fullScreenCover(item: $play) { t in
-            DYListPlayer(bridge: bridge, title: t.title, items: t.items, start: t.start, loadMore: nil, onAuthor: onAuthor)
+            DYListPlayer(bridge: bridge, title: t.title, items: t.items, start: t.start,
+                         loadMore: t.more.isEmpty ? nil : { await im.details(Array(t.more.prefix(4))) }, onAuthor: onAuthor)
         }
         .onAppear { im.chatVisible = true; im.open(conversation) }
         .onDisappear { im.closeChat() }
@@ -738,8 +808,15 @@ struct DYChatScreen: View {
         guard opening == nil else { return }
         opening = m.id
         Task {
-            if let a = await im.openCard(m) { play = DYListTarget(title: conversation.name, items: [a], start: 0, model: nil) }
-            else { toast = "这个视频打不开"; DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { toast = nil } }
+            guard let a = await im.openCard(m) else { show("这个视频打不开"); opening = nil; return }
+            // 这个聊天里所有分享的视频串成一列，从点的这条开始，能上下滑着看
+            let vids = im.messages.filter { ($0.kind == .share || $0.kind == .video) && $0.itemId != nil }
+            var items: [DYAweme] = [a]
+            if let i = vids.firstIndex(where: { $0.id == m.id }) {
+                for v in vids.dropFirst(i + 1).prefix(3) { if let x = await im.detail(v.itemId!) { items.append(x) } }
+            }
+            let rest = vids.compactMap(\.itemId).filter { id in !items.contains { $0.id == id } }
+            play = DYListTarget(title: conversation.name, items: items, start: 0, model: nil, more: rest)
             opening = nil
         }
     }
@@ -753,7 +830,8 @@ struct DYChatScreen: View {
             HStack(alignment: .top, spacing: 8) {
                 if m.fromMe { Spacer(minLength: 50) } else { avatar(m.avatar ?? conversation.avatar, size: 36) }
                 content(m)
-                    .onLongPressGesture(minimumDuration: 0.35) { longPress(m) }
+                    .contentShape(Rectangle())
+                    .simultaneousGesture(LongPressGesture(minimumDuration: 0.4).onEnded { _ in longPress(m) })
                 if !m.fromMe { Spacer(minLength: 50) }
             }
         }

@@ -10,7 +10,7 @@ packages:
 settings:
   base:
     MARKETING_VERSION: 1.2.1
-    CURRENT_PROJECT_VERSION: "32"
+    CURRENT_PROJECT_VERSION: "33"
     SWIFT_VERSION: "5.0"
     DEVELOPMENT_TEAM: ""
 targets:
