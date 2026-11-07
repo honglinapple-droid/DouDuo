@@ -18,17 +18,17 @@ jobs:
           xcrun simctl list runtimes | tee out/runtimes.txt
           xcrun simctl list devices available | tee out/devices.txt
       - name: Dump iPhone Duo device profile
+        continue-on-error: true
         run: |
-          DT="$(xcode-select -p)/Platforms/iPhoneOS.platform/Library/Developer/CoreSimulator/Profiles/DeviceTypes"
-          ls "$DT" > out/devicetypes.txt
-          D="$DT/iPhone Duo.simdevicetype"
-          ls -R "$D" | head -50
+          D=$(find /Applications/Xcode_27.1.app /Library/Developer/CoreSimulator "$(xcode-select -p)" -maxdepth 14 -name "iPhone Duo.simdevicetype" 2>/dev/null | head -1)
+          echo "devicetype bundle: $D" | tee out/duo-profile.txt
+          [ -z "$D" ] && { echo "not found; listing candidates"; find / -maxdepth 14 -name "*.simdevicetype" 2>/dev/null | head -20 | tee -a out/duo-profile.txt; exit 0; }
+          ls -R "$D" | head -60
           for f in profile.plist capabilities.plist; do
-            echo "--- $f"; plutil -p "$D/Contents/Resources/$f" | tee -a out/duo-profile.txt
+            echo "--- $f" | tee -a out/duo-profile.txt; plutil -p "$D/Contents/Resources/$f" | tee -a out/duo-profile.txt
           done
           cp -R "$D/Contents/Resources" out/duo-resources || true
-          # 同时抓一台直板机做对照
-          plutil -p "$DT/iPhone 17.simdevicetype/Contents/Resources/profile.plist" > out/iphone17-profile.txt || true
+          P=$(dirname "$D"); plutil -p "$P/iPhone 17.simdevicetype/Contents/Resources/profile.plist" > out/iphone17-profile.txt || true
       - name: Boot iPhone Duo and screenshot both postures
         continue-on-error: true
         run: |
