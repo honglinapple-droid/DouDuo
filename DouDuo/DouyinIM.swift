@@ -440,14 +440,21 @@ final class DYIMModel: ObservableObject {
         } catch { self.error = error.localizedDescription }
     }
 
+    /// 已经弹过横幅的「人 + 内容」，同一条不再弹（时间文字从"刚刚"变"1分钟前"不算新消息）
+    private var bannered: Set<String> = []
+
     private func detectNew(old: [DYIMConversation], new: [DYIMConversation]) {
         guard !old.isEmpty else { return }
         let prev = Dictionary(old.map { ($0.name, $0) }, uniquingKeysWith: { a, _ in a })
         for c in new {
             guard let p = prev[c.name] else { continue }
+            let key = c.name + "|" + c.last
+            guard !bannered.contains(key) else { continue }
             let more = c.unread > p.unread
-            let changed = (c.last != p.last || c.time != p.time) && c.name != openName
+            let changed = c.last != p.last && c.name != openName
             if more || (changed && !chatVisible) {
+                bannered.insert(key)
+                if bannered.count > 200 { bannered.removeAll() }
                 banner = DYIMBanner(name: c.name, text: c.last, avatar: c.avatar)
                 bannerTask?.cancel()
                 bannerTask = Task { try? await Task.sleep(nanoseconds: 5_000_000_000); if !Task.isCancelled { banner = nil } }
