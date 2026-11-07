@@ -88,6 +88,11 @@ extension PlayerPage {
 }
 
 struct PlayerPage: View {
+    /// 沉底布局：进度条控件距屏幕底边（细线本身再高 8pt，共 18pt，刚好让开 Home 条）
+    static let barBottomGap: CGFloat = 10
+    /// 沉底布局：文案距屏幕底边（在时间文字上方）
+    static let captionBottomGap: CGFloat = 50
+
     let id: String
     let url: URL
     let knownDuration: Double
@@ -154,7 +159,7 @@ struct PlayerPage: View {
             }
         }
         .overlay(alignment: .bottom) {
-            if isActive { progressBar.padding(.bottom, max(bottomInset, 18)) }
+            if isActive { progressBar.padding(.bottom, Self.barBottomGap) }
         }
         .onAppear {
             if player == nil { setup() }
@@ -281,7 +286,9 @@ struct PlayerPage: View {
             }
             .frame(height: 16)
             .padding(.horizontal, 16)
-            // 常驻拖动区：高 40，按住左右拖拉进度
+        }
+        // 常驻拖动区：高 40，按住左右拖拉进度。叠在进度条上而不是垫在下面，否则细线沉不到底
+        .overlay(alignment: .bottom) {
             Color.white.opacity(0.001).frame(height: 40).contentShape(Rectangle())
                 .gesture(DragGesture(minimumDistance: 0)
                     .onChanged { v in
