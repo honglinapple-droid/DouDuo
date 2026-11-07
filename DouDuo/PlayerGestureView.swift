@@ -171,3 +171,52 @@ struct PlayerGestureView: UIViewRepresentable {
         }
     }
 }
+
+// MARK: - 底部进度条拖动区（UIKit pan）
+// 原来用 SwiftUI 的 DragGesture：手势被打断（切后台、来电、被翻页抢走、滑出边缘）时只"取消"不"结束"，
+// 播放器一直以为手还按着，预览浮层挂在屏幕上、进度不动，再拖一下才恢复。UIKit 的 pan 取消也会回调。
+struct SeekZoneGestureView: UIViewRepresentable {
+    var onBegan: () -> Void
+    var onChanged: (CGFloat) -> Void      // 横向位移
+    var onEnded: () -> Void
+    var onCancelled: () -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeUIView(context: Context) -> UIView {
+        let v = UIView()
+        v.backgroundColor = .clear
+        let pan = UIPanGestureRecognizer(target: context.coordinator, action: #selector(Coordinator.handle(_:)))
+        pan.delegate = context.coordinator
+        v.addGestureRecognizer(pan)
+        return v
+    }
+    func updateUIView(_ uiView: UIView, context: Context) { context.coordinator.parent = self }
+    static func dismantleUIView(_ uiView: UIView, coordinator: Coordinator) { if coordinator.active { coordinator.active = false; coordinator.parent.onCancelled() } }
+
+    final class Coordinator: NSObject, UIGestureRecognizerDelegate {
+        var parent: SeekZoneGestureView
+        var active = false
+        init(_ p: SeekZoneGestureView) { parent = p }
+
+        @objc func handle(_ g: UIPanGestureRecognizer) {
+            guard let v = g.view else { return }
+            switch g.state {
+            case .began: active = true; parent.onBegan(); parent.onChanged(g.translation(in: v).x)
+            case .changed: parent.onChanged(g.translation(in: v).x)
+            case .ended: active = false; parent.onEnded()
+            case .cancelled, .failed: active = false; parent.onCancelled()
+            default: break
+            }
+        }
+        // 竖向起手（想翻页）就不接，让给外层列表；横向才算拖进度
+        func gestureRecognizerShouldBegin(_ g: UIGestureRecognizer) -> Bool {
+            guard let pg = g as? UIPanGestureRecognizer, let v = g.view else { return true }
+            var d = pg.velocity(in: v)
+            if abs(d.x) < 1, abs(d.y) < 1 { d = pg.translation(in: v) }
+            if abs(d.x) < 0.5, abs(d.y) < 0.5 { return true }
+            return abs(d.x) >= abs(d.y)
+        }
+        func gestureRecognizer(_ g: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool { false }
+    }
+}

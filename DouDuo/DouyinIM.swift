@@ -247,26 +247,76 @@ private enum DYIMJS {
     /// 把一个视频以卡片形式分享给朋友。前提：后台网页已经**整页跳到** /jingxuan?modal_id=视频号
     ///（b38 用"改地址 + 假 popstate"在刚加载的页面上抖音根本不响应，每次都报没打开；真加载 3 秒弹窗就开）。
     /// 弹窗 → 悬停分享按钮出面板 → 「最近分享」里有这个人就点他旁边的「分享」；没有就点「分享给朋友」进完整列表找
+    /// 诊断：后台网页此刻的状态（分享失败时写进日志和提示，不再猜）
+    static let pageState = #"""
+    const sb = document.querySelector('[data-e2e=video-player-share]');
+    return JSON.stringify({ href: location.href, ready: document.readyState, title: document.title.slice(0, 30), w: innerWidth, h: innerHeight,
+      vis: document.visibilityState, share: !!sb, shareW: sb ? Math.round(sb.getBoundingClientRect().width) : -1,
+      im: !!document.querySelector('.imContainer'), videos: document.querySelectorAll('video').length,
+      text: (document.body && document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 80) });
+    """#
+
+    /// 探针：分享面板没出来时，列出页面上可见的、带"分享/发送/朋友"字样或 share 类名的元素（看抖音在这个环境里到底渲染了什么）
+    static let shareProbe = helpers + #"""
+    const vis = el => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+    const share = document.querySelector('[data-e2e=video-player-share]');
+    const chain = []; let e = share; for (let i = 0; i < 6 && e; i++) { chain.push((e.tagName + '.' + (e.className || '').toString().slice(0, 40)) + ' h=' + (e.onmouseenter ? 1 : 0) + ' c=' + (e.onclick ? 1 : 0)); e = e.parentElement; }
+    const hits = [...document.querySelectorAll('*')].filter(x => vis(x) && x.childElementCount <= 2 && /分享|发送|朋友|复制链接/.test(txt(x)) && txt(x).length < 20 && !x.closest('.imContainer')).slice(0, 25).map(x => x.tagName + '.' + (x.className || '').toString().slice(0, 30) + ':' + txt(x).slice(0, 12));
+    const handlers = []; e = share; for (let i = 0; i < 8 && e; i++) { let f = e[fk(e)]; const names = new Set(); for (let k = 0; k < 4 && f; k++) { Object.keys(f.memoizedProps || {}).filter(n => /^on[A-Z]/.test(n)).forEach(n => names.add(n)); f = f.return; } if (names.size) handlers.push(i + ':' + [...names].join(',')); e = e.parentElement; }
+    const shareCls = [...document.querySelectorAll('[class*=share], [class*=Share]')].filter(vis).slice(0, 15).map(x => x.tagName + '.' + (x.className || '').toString().slice(0, 50));
+    const popups = [...document.querySelectorAll('[class*=popover], [class*=Popover], [class*=modal], [class*=Modal], [role=tooltip]')].filter(vis).slice(0, 10).map(x => x.tagName + '.' + (x.className || '').toString().slice(0, 50) + ':' + txt(x).slice(0, 30));
+    return JSON.stringify({ chain, handlers, hits, shareCls, popups, touch: 'ontouchstart' in window, hover: matchMedia('(hover: hover)').matches, pointer: matchMedia('(pointer: fine)').matches, ua: navigator.userAgent.slice(0, 60) });
+    """#
+
     static let shareOnPage = helpers + #"""
     const hov = el => { const r = el.getBoundingClientRect(); for (const t of ['pointerover', 'pointerenter', 'mouseover', 'mouseenter', 'mousemove']) el.dispatchEvent(new (t.startsWith('pointer') ? PointerEvent : MouseEvent)(t, { bubbles: true, clientX: r.x + r.width / 2, clientY: r.y + r.height / 2, pointerId: 1 })); };
-    const panelBtns = () => [...document.querySelectorAll('*')].filter(x => x.childElementCount <= 1 && txt(x) === '分享' && x.getBoundingClientRect().width > 0 && x.getBoundingClientRect().width < 120 && !x.closest('.imContainer'));
+    const panelBtns = () => [...document.querySelectorAll('*')].filter(x => x.childElementCount <= 1 && txt(x) === '分享' && x.getBoundingClientRect().width > 0 && x.getBoundingClientRect().width < 400 && !x.closest('.imContainer'));   // 隐藏页视口 2400 宽，按钮尺寸翻倍，120 会把它滤掉
     const waitChange = async (btn) => { const l0 = txt(btn); fire(btn); for (let k = 0; k < 15; k++) { await sleep(150); const t1 = document.body.contains(btn) ? txt(btn) : ''; if (t1 !== l0) return true; } return false; };
     let share = null;
     for (let i = 0; i < 50; i++) { share = document.querySelector('[data-e2e=video-player-share]'); if (share && share.getBoundingClientRect().width > 0) break; await sleep(200); }
     document.querySelectorAll('video').forEach(v => { try { v.pause(); } catch (e) {} });
     if (!share) return JSON.stringify({ ok: false, why: 'no-modal' });
-    await sleep(800);
+    // 模拟器实测：整页跳转后抖音会把上次开着的消息面板也恢复出来，盖在视频弹窗上，分享面板就悬停不出来（no-panel）。
+    // 先把消息面板收起来（点一下消息入口），发完再由 restoreAfterShare 重新打开
+    await sleep(1200);   // 抖音会在加载后一拍才把消息面板恢复出来，等它出完再处理
+    const imOpen = () => { const c = document.querySelector('.imContainer'); return !!c && c.getBoundingClientRect().width > 0; };
+    if (imOpen()) { const ie = document.querySelector('[data-e2e=im-entry]'); if (ie) { fire(ie); await sleep(700); } }
+    if (imOpen()) { const x = document.querySelector('.imContainer [class*=close], .imContainer [class*=Close]'); if (x) { fire(x); await sleep(500); } }
     let e = share;
-    for (let i = 0; i < 5 && e && !panelBtns().length; i++) { hov(e); await sleep(400); e = e.parentElement; }
-    if (!panelBtns().length) { e = share; for (let i = 0; i < 5 && e && !panelBtns().length; i++) { fire(e); await sleep(500); e = e.parentElement; } }
+    for (let i = 0; i < 3 && e && !panelBtns().length; i++) { hov(e); await sleep(400); e = e.parentElement; }
+    let via = 'hover';
+    if (!panelBtns().length) {
+      // iOS WebKit 里 matchMedia('(hover: hover)') 是 false，合成的鼠标事件抖音可能不理：直接去 React 树里找挂在分享按钮祖先上的 onMouseEnter / onClick 调一下
+      const fakeEv = el => ({ currentTarget: el, target: el, preventDefault() {}, stopPropagation() {}, persist() {}, nativeEvent: {}, type: 'synthetic' });
+      e = share;
+      outer: for (let i = 0; i < 8 && e; i++) {
+        let f = e[fk(e)];
+        for (let k = 0; k < 4 && f; k++) {
+          const pr = f.memoizedProps || {};
+          for (const name of ['onMouseEnter', 'onPointerEnter', 'onMouseOver', 'onClick']) {
+            if (typeof pr[name] === 'function') {
+              try { pr[name](fakeEv(e)); } catch (err) {}
+              // 面板是异步渲染的，模拟器实测 500ms 还没出来、探针跑的时候才出来：这里等到 3 秒
+              for (let w = 0; w < 15 && !panelBtns().length; w++) await sleep(200);
+              if (panelBtns().length) { via = 'fiber:' + name + '@' + i; break outer; }
+            }
+          }
+          f = f.return;
+        }
+        e = e.parentElement;
+      }
+    }
     if (!panelBtns().length) return JSON.stringify({ ok: false, why: 'no-panel' });
-    const rows = panelBtns().map(b => { let row = b; for (let i = 0; i < 6 && row && !row.querySelector('img'); i++) row = row.parentElement; return { b, row, t: txt(row) }; });
-    const hit = rows.find(x => x.t.split('\n')[0].trim() === name) || rows.find(x => x.t.startsWith(name) && !/^分享给朋友/.test(x.t));
-    if (hit) { const changed = await waitChange(hit.b); await sleep(400); return JSON.stringify({ ok: true, changed, via: 'recent' }); }
-    // 不在「最近分享」里：点「分享给朋友」，打开完整的选择朋友弹窗
-    const more = rows.find(x => /^分享给朋友/.test(x.t));
-    if (!more) return JSON.stringify({ ok: false, why: 'no-friend', n: rows.length });
-    fire(more.b);
+    // 每个「分享」按钮往上找最近的一行（文字短、第一行就是名字）；名字必须和目标**完全相等**才点，
+    // 绝不点别人的（之前"往上爬到带头像的容器"在 2 倍视口下会爬过头，拿到整个面板的文字）
+    const rowOf = b => { let e = b.parentElement; for (let i = 0; i < 6 && e; i++) { const t = txt(e); if (t.length > 0 && t.length < 60 && t !== '分享') return t; e = e.parentElement; } return ''; };
+    const rows = panelBtns().map(b => ({ b, t: rowOf(b) }));
+    const hit = rows.find(x => x.t.split('\n')[0].trim() === name);
+    if (hit) { const changed = await waitChange(hit.b); await sleep(400); return JSON.stringify({ ok: true, changed, via: 'recent/' + via }); }
+    // 不在「最近分享」里：点面板里「分享给朋友」这一项本身（不是某个人旁边的分享钮），打开完整的选择朋友弹窗
+    const more = [...document.querySelectorAll('*')].find(x => x.childElementCount <= 2 && txt(x) === '分享给朋友' && x.getBoundingClientRect().width > 0 && !x.closest('.imContainer'));
+    if (!more) return JSON.stringify({ ok: false, why: 'no-friend', n: rows.length, names: rows.map(x => x.t.split('\n')[0]).slice(0, 8).join('|') });
+    fire(more);
     let modal = null;
     for (let i = 0; i < 20; i++) { await sleep(150); modal = [...document.querySelectorAll('.semi-modal-content')].find(m => /选择朋友/.test(m.innerText || '')); if (modal) break; }
     if (!modal) return JSON.stringify({ ok: false, why: 'no-picker' });
@@ -362,6 +412,13 @@ final class DYIMWeb: NSObject, WKNavigationDelegate {
     }
 
     func waitReady() async { if ready { return }; await withCheckedContinuation { waiters.append($0) } }
+
+    /// 原样返回脚本的字符串结果（诊断用）
+    func evalRaw(_ js: String, _ args: [String: Any] = [:]) async throws -> String {
+        await waitReady()
+        let r = try await web.callAsyncJavaScript(js, arguments: args, contentWorld: .page)
+        return (r as? String) ?? "nil"
+    }
 
     func eval<T: Decodable>(_ js: String, _ args: [String: Any] = [:], as: T.Type) async throws -> T {
         await waitReady()
@@ -578,6 +635,11 @@ final class DYIMModel: ObservableObject {
 
     private struct MenuInfo: Decodable { let ok: Bool; let items: [String]?; let emojis: [String]? }
     private struct ActionResp: Decodable { let ok: Bool; let confirmed: Bool?; let reference: String?; let why: String? }
+    struct PageState: Decodable, CustomStringConvertible {
+        let href: String; let ready: String; let title: String; let w: Int; let h: Int; let vis: String
+        let share: Bool; let shareW: Int; let im: Bool; let videos: Int; let text: String
+        var description: String { "href=\(href) ready=\(ready) title=\(title) \(w)x\(h) vis=\(vis) share=\(share)/\(shareW) im=\(im) videos=\(videos) text=\(text)" }
+    }
     @Published var replyingTo: String?     // 正在回复的那条的摘要（网页的引用栏文字）
     @Published var quickEmojis: [String] = ["[微笑]", "[色]", "[发呆]", "[酷拽]", "[抠鼻]"]
 
@@ -654,16 +716,22 @@ final class DYIMModel: ObservableObject {
         guard loggedIn else { lastSendError = "抖音未登录"; return false }
         guard !sharing else { lastSendError = "上一条还在发，稍等"; return false }
         sharing = true
+        let t0 = Date()
         await web.navigate(URL(string: "https://www.douyin.com/jingxuan?modal_id=\(id)")!)
         panelReady = false
+        let st0 = (try? await web.eval(DYIMJS.pageState, as: PageState.self))
+        DYLiveModel.log("DDSHARE loaded \(String(format: "%.1f", Date().timeIntervalSince(t0)))s state=\(st0.map { "\($0)" } ?? "nil")")
         let r = try? await web.eval(DYIMJS.shareOnPage, ["name": c.name], as: ActionResp.self)
+        let st1 = (r?.ok == true) ? nil : (try? await web.eval(DYIMJS.pageState, as: PageState.self))
+        if r?.ok != true, let probe = try? await web.evalRaw(DYIMJS.shareProbe) { DYLiveModel.log("DDSHARE probe \(probe)") }
+        DYLiveModel.log("DDSHARE result=\(r.map { "\($0.ok) \($0.why ?? "")" } ?? "nil") \(String(format: "%.1f", Date().timeIntervalSince(t0)))s state=\(st1.map { "\($0)" } ?? "-")")
         Task { await restoreAfterShare() }
         guard let r else { lastSendError = "网页没响应，等几秒再试"; return false }
         if !r.ok {
             switch r.why ?? "" {
             case "no-friend": lastSendError = "网页的朋友列表里没找到 \(c.name)"
             case "no-panel": lastSendError = "网页分享面板没打开，再试一次"
-            case "no-modal": lastSendError = "网页没打开这个视频，再试一次"
+            case "no-modal": lastSendError = "网页没打开这个视频（\(st1.map { "\($0.ready) \($0.w)x\($0.h) \($0.vis) \($0.title)" } ?? "?")）"
             case "no-picker": lastSendError = "网页的选择朋友弹窗没打开，再试一次"
             default: lastSendError = "没发出去"
             }

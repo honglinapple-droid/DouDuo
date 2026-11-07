@@ -1083,6 +1083,10 @@ struct DYFollowFeed: View {
     let onAuthor: (DYAweme) -> Void
     let onLogin: () -> Void
     let onToast: (String) -> Void
+    /// 分享给朋友（推荐页传进来，走同一个朋友选择器）
+    var onShare: ((DYAweme) -> Void)? = nil
+    /// 长按 2 倍速进 / 出（外层藏顶栏）
+    var onBoost: ((Bool) -> Void)? = nil
     @StateObject private var model: DYPagedModelHolder = DYPagedModelHolder()
     @State private var currentID: String?
     @State private var preloader = DYPreloader()
@@ -1093,6 +1097,10 @@ struct DYFollowFeed: View {
 
     var body: some View {
         let m = model.model(bridge)
+        GeometryReader { geo in
+        // 和推荐页 / 列表播放器一样：Duo 内屏（短边 >= 600）评论左右分屏，外屏从底部弹出（b45 之前这里只有底部弹出）
+        let wide = min(geo.size.width, geo.size.height) >= 600
+        HStack(spacing: 0) {
         ZStack {
             if m.items.isEmpty {
                 VStack(spacing: 12) {
@@ -1119,9 +1127,12 @@ struct DYFollowFeed: View {
                                         resume: resume[item.id], liked: liked.contains(item.id) || item.userDigged == 1,
                                         collected: collected.contains(item.id) || item.isCollect == 1,
                                         onLike: { like(item.id, force: nil) }, onCollect: { collect(item.id) },
-                                        onDoubleTap: { like(item.id, force: true) }, onComments: { showComments = true },
+                                        onDoubleTap: { like(item.id, force: true) }, onComments: { withAnimation(.snappy) { showComments.toggle() } },
                                         onAuthor: { onAuthor(item) }, onSavePosition: { resume[item.id] = $0 },
-                                        preloader: preloader, bridge: bridge, onToast: onToast)
+                                        preloader: preloader, bridge: bridge, onToast: onToast,
+                                        followed: true,
+                                        onShare: onShare.map { f in { f(item) } },
+                                        onBoost: onBoost)
                                 .containerRelativeFrame([.horizontal, .vertical])
                                 .id(item.id)
                         }
@@ -1134,11 +1145,19 @@ struct DYFollowFeed: View {
                 .ignoresSafeArea()
             }
         }
-        .sheet(isPresented: $showComments) {
+        if wide && showComments, let cur = m.items.first(where: { $0.id == currentID }) {
+            DYCommentPanel(bridge: bridge, aweme: cur, onClose: { withAnimation(.snappy) { showComments = false } })
+                .frame(width: min(380, geo.size.width * 0.36))
+                .id(cur.id)
+                .transition(.move(edge: .trailing))
+        }
+        }
+        .sheet(isPresented: Binding(get: { showComments && !wide }, set: { showComments = $0 })) {
             if let cur = m.items.first(where: { $0.id == currentID }) {
                 DYCommentPanel(bridge: bridge, aweme: cur, onClose: { showComments = false })
                     .presentationDetents([.fraction(0.62), .large])
             }
+        }
         }
         .task {
             if m.items.isEmpty { await m.loadMore() }

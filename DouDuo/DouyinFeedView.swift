@@ -1199,7 +1199,9 @@ struct DouyinFeedScreen: View {
                 DYFollowFeed(bridge: bridge, insets: insets, refresh: followRefresh, active: tab == .follow && web == nil && !showSearch && !showMine,
                              onAuthor: { a in authorTarget = a.author },
                              onLogin: { web = DYWebTarget(url: DouyinWeb.home) },
-                             onToast: { showToast($0) })
+                             onToast: { showToast($0) },
+                             onShare: { shareTarget = $0 },
+                             onBoost: { boosting = $0 })
             } else {
                 recommendArea
             }
@@ -2230,7 +2232,7 @@ struct DYVideoPage: View {
             .padding(.bottom, followed ? 0 : 8)
             action(liked ? "heart.fill" : "heart", DYFormat.count(item.stats.digg + (liked ? 1 : 0)),
                    tint: liked ? theme.status.danger.color(for: scheme) : fg, "douyin.like", onLike)
-            action("ellipsis.message.fill", DYFormat.count(item.stats.comment), tint: fg, "douyin.comments", onComments)
+            action("ellipsis.message", DYFormat.count(item.stats.comment), tint: fg, "douyin.comments", onComments)   // 线框，和点赞/收藏一致
             // 弹幕按钮已按用户要求去掉（2026-11-07）
             action(collected ? "star.fill" : "star",
                    DYFormat.count(item.stats.collect + (collected ? 1 : 0)),
@@ -2240,11 +2242,11 @@ struct DYVideoPage: View {
             }
             // 分享：直接选朋友发过去（抖音同款），不走系统分享菜单
             if let onShare {
-                action("arrowshape.turn.up.right.fill", DYFormat.count(item.stats.share), tint: fg, "douyin.share") { onShare() }
+                action("arrowshape.turn.up.right", DYFormat.count(item.stats.share), tint: fg, "douyin.share") { onShare() }
             } else {
                 ShareLink(item: item.webURL) {
                     VStack(spacing: 3) {
-                        Image(systemName: "arrowshape.turn.up.right.fill").font(.system(size: theme.typography.pointSize(.displayLarge)))
+                        Image(systemName: "arrowshape.turn.up.right").font(.system(size: theme.typography.pointSize(.displayLarge)))
                         Text(DYFormat.count(item.stats.share)).font(.caption2.weight(.semibold))
                     }
                     .foregroundStyle(fg)

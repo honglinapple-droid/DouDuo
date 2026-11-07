@@ -143,6 +143,7 @@ struct PlayerPage: View {
     @State private var vlc: VLCPlayerController?        // AVPlayer 起播失败 → VLC 软解兜底
     @State private var avRetried = false
     @State private var loadFailed = false          // AVPlayer 和 VLC 都起不来，提示换下一条
+    @State private var seekTouchedAt = Date()      // 拖进度时手指最后一次动的时间（卡住兜底用）
     private let playbackID = UUID()
 
     var body: some View {
@@ -209,8 +210,17 @@ struct PlayerPage: View {
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
             resumeAfterBackground()
         }
+        // 拖进度卡住兜底：无论哪条路进来的 seeking，1.5 秒没有新的手指位置就按最后位置跳过去、收起浮层
+        .task(id: seeking) {
+            guard seeking else { return }
+            while seeking && !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 500_000_000)
+                if seeking, Date().timeIntervalSince(seekTouchedAt) > 1.5 { seekTo(seekPreview); seeking = false; previewImage = nil }
+            }
+        }
         .onChange(of: isActive) { _, active in
             if !active, rateBoost { setBoost(false) }   // 滑走时还按着：2 倍速状态清掉，外层恢复
+            if !active, seeking { cancelSeek() }        // 滑走时还在拖：拖动状态清掉
             if let v = vlc {
                 if active { v.mediaPlayer.audio?.isMuted = false; v.mediaPlayer.play(); isPlaying = true }
                 else { v.mediaPlayer.pause(); isPlaying = false; onSavePosition(v.current) }
@@ -251,10 +261,12 @@ struct PlayerPage: View {
                 else if let p = player { current = p.currentTime().seconds } else { return }
                 holdAnchor = current
                 seekPreview = current
+                seekTouchedAt = Date()
                 seeking = true
             },
             onSeekChanged: { dx, w in
                 guard duration > 0, seeking else { return }
+                seekTouchedAt = Date()
                 seekPreview = max(0, min(duration, holdAnchor + dx / max(w, 1) * duration * 0.9))
                 seekDelta = seekPreview - current
                 requestPreview(seekPreview)
@@ -318,18 +330,24 @@ struct PlayerPage: View {
             .frame(height: 16)
             .padding(.horizontal, 16)
         }
-        // 常驻拖动区：高 40，按住左右拖拉进度。叠在进度条上而不是垫在下面，否则细线沉不到底
+        // 常驻拖动区：高 40，按住左右拖拉进度。叠在进度条上而不是垫在下面，否则细线沉不到底。
+        // b45：改 UIKit 手势，被打断也能收到"取消"，不会再把拖动状态卡在屏幕上
         .overlay(alignment: .bottom) {
-            Color.white.opacity(0.001).frame(height: 40).contentShape(Rectangle())
-                .gesture(DragGesture(minimumDistance: 0)
-                    .onChanged { v in
-                        guard duration > 0 else { return }
-                        if !seeking { holdAnchor = current; seeking = true }
-                        seekPreview = max(0, min(duration, holdAnchor + v.translation.width / max(barWidth, 1) * duration))
-                        seekDelta = seekPreview - current
-                        requestPreview(seekPreview)
-                    }
-                    .onEnded { _ in if seeking { seekTo(seekPreview); seeking = false; previewImage = nil } })
+            SeekZoneGestureView(
+                onBegan: {
+                    guard duration > 0 else { return }
+                    holdAnchor = current; seekPreview = current; seekDelta = 0; seeking = true; seekTouchedAt = Date()
+                },
+                onChanged: { dx in
+                    guard duration > 0, seeking else { return }
+                    seekTouchedAt = Date()
+                    seekPreview = max(0, min(duration, holdAnchor + dx / max(barWidth, 1) * duration))
+                    seekDelta = seekPreview - current
+                    requestPreview(seekPreview)
+                },
+                onEnded: { if seeking { seekTo(seekPreview); seeking = false; previewImage = nil } },
+                onCancelled: { cancelSeek() })
+            .frame(height: 40)
         }
     }
 
@@ -424,8 +442,14 @@ struct PlayerPage: View {
         watchdog(p)
     }
 
+    /// 拖进度被打断：不跳转，直接收起浮层、恢复正常刷新
+    private func cancelSeek() {
+        seeking = false; previewImage = nil; seekDelta = 0
+    }
+
     /// 失焦/切后台：立即暂停并释放音频会话，声音一秒都不该多留
     private func pauseForBackground() {
+        if seeking { cancelSeek() }
         #if DEBUG
         ddWrite("DDBG pauseForBackground id=\(id) vlc=\(vlc != nil) av=\(player != nil) rate=\(player?.rate ?? -9) t=\(String(format: "%.1f", player?.currentTime().seconds ?? -1)) active=\(isActive)")
         #endif
@@ -550,6 +574,7 @@ struct PlayerPage: View {
 
     private func teardown() {
         loadFailed = false
+        if seeking { cancelSeek() }
         if rateBoost { rateBoost = false; onRateBoost?(false) }
         if let v = vlc { onSavePosition(v.current); v.onEnd = nil; v.onProgress = nil; v.stop(); vlc = nil }
         if let p = player { onSavePosition(p.currentTime().seconds) }
