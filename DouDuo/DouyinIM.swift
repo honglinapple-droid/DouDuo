@@ -232,6 +232,32 @@ private enum DYIMJS {
     return JSON.stringify({ ok: true, changed });
     """#
 
+    /// 把网页的聊天列表往上滚一段，让它渲染出更早的消息（列表是 column-reverse，往上 = scrollTop 变负）
+    static let loadOlder = helpers + #"""
+    const list = document.querySelector('.messageMessageListlist');
+    if (!list) return JSON.stringify({ ok: false });
+    const n0 = boxesNewestFirst().length;
+    list.scrollTop = list.scrollTop - 2500; list.dispatchEvent(new Event('scroll', { bubbles: true }));
+    for (let i = 0; i < 12; i++) { await sleep(150); if (boxesNewestFirst().length > n0) break; }
+    await sleep(300);
+    return JSON.stringify({ ok: true, n: boxesNewestFirst().length, grew: boxesNewestFirst().length > n0 });
+    """#
+
+    /// 双击朋友分享的视频卡片 = 点赞（网页会出现「你赞了对方分享的视频」）
+    static let likeCard = menuHelpers + #"""
+    const b = boxAt(box);
+    if (!b) return JSON.stringify({ ok: false, why: 'no-box' });
+    const c = b.querySelector('.MessageItemShareAwemecontainer') || b.querySelector('.BulletBulletVideocontainer') || b.querySelector('.messageMessageBoxcontentBox') || b;
+    const before = boxesNewestFirst().filter(x => /你赞了/.test(x.innerText)).length;
+    const r = c.getBoundingClientRect(); const o = { bubbles: true, cancelable: true, clientX: r.x + r.width / 2, clientY: r.y + r.height / 2, button: 0, pointerId: 1, isPrimary: true };
+    for (let k = 0; k < 2; k++) { for (const t of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) c.dispatchEvent(new (t.startsWith('pointer') ? PointerEvent : MouseEvent)(t, Object.assign({}, o, { detail: k + 1 }))); }
+    c.dispatchEvent(new MouseEvent('dblclick', Object.assign({}, o, { detail: 2 })));
+    let liked = false;
+    for (let i = 0; i < 12; i++) { await sleep(150); if (boxesNewestFirst().filter(x => /你赞了/.test(x.innerText)).length > before) { liked = true; break; } }
+    closeModal();
+    return JSON.stringify({ ok: liked });
+    """#
+
     /// 取消回复
     static let replyCancel = helpers + #"""
     const c = document.querySelector('.MsgInputReferenceclose'); fire(c);
@@ -359,6 +385,10 @@ final class DYIMModel: ObservableObject {
     @Published var banner: DYIMBanner?
     @Published var unreadTotal = 0
     @Published var pendingOpen: String?
+    /// 我自己的头像（从我发的消息里取）
+    @Published var myAvatar: String?
+    /// 发送失败的原因（给界面提示用）
+    @Published var lastSendError: String?
     var listVisible = false
     var chatVisible = false
 
@@ -469,8 +499,37 @@ final class DYIMModel: ObservableObject {
                                                  author: $0.author.isEmpty ? nil : $0.author, cover: $0.cover.isEmpty ? nil : $0.cover, avatar: $0.avatar.isEmpty ? nil : $0.avatar,
                                                  itemId: ($0.itemId ?? "").isEmpty ? nil : $0.itemId) }
             guard !fresh.isEmpty else { return }
-            if fresh != messages { messages = fresh; DYIMCache.save(name, fresh) }
+            let stable = Self.stabilize(fresh)
+            if let mine = stable.last(where: { $0.fromMe && $0.avatar != nil }) { myAvatar = mine.avatar }
+            if stable != messages { messages = stable; DYIMCache.save(name, stable) }
         } catch { self.error = error.localizedDescription }
+    }
+
+    /// 消息编号按内容算（同样内容第几次出现也算进去），不随网页里的位置变；否则来一条新消息整列都重建、滚动位置被拉回底部
+    private static func stabilize(_ msgs: [DYIMMessage]) -> [DYIMMessage] {
+        var seen: [String: Int] = [:]
+        return msgs.map { m in
+            let base = "\(m.kind.rawValue)|\(m.fromMe)|\(m.text)|\(m.cover ?? "")|\(m.itemId ?? "")"
+            let n = seen[base, default: 0]; seen[base] = n + 1
+            var h = Hasher(); h.combine(base); h.combine(n)
+            return DYIMMessage(id: h.finalize(), box: m.box, kind: m.kind, fromMe: m.fromMe, text: m.text, author: m.author, cover: m.cover, avatar: m.avatar, itemId: m.itemId)
+        }
+    }
+
+    /// 往上拉到顶：让网页渲染更早的消息，再读一遍
+    func loadOlder() async -> Bool {
+        guard let r = try? await web.eval(DYIMJS.loadOlder, as: ActionResp.self), r.ok else { return false }
+        await refreshMessages()
+        return true
+    }
+
+    /// 双击卡片点赞。先走网页（对方会收到「赞了你分享的视频」），不行就直接给视频点赞（对方收不到通知）
+    func likeCard(_ m: DYIMMessage) async -> String {
+        if let r = try? await web.eval(DYIMJS.likeCard, ["box": m.box], as: ActionResp.self), r.ok { await refreshMessages(); return "已点赞" }
+        if let id = m.itemId, let bridge, let r = try? await bridge.digg(id, like: true) {
+            switch r { case .ok: return "已给视频点赞（对方不会收到通知）"; case .notLoggedIn: return "抖音未登录"; case .failed(let w): return "点赞失败：\(w)" }
+        }
+        return "点赞失败"
     }
 
     func send(_ text: String) async -> Bool {
@@ -514,11 +573,13 @@ final class DYIMModel: ObservableObject {
         return true
     }
 
-    /// 转发给朋友：打开那个人的会话，把内容当消息发出去（视频发的是链接，抖音会显示成视频卡片）
+    /// 发给朋友：打开那个人的会话，把内容当消息发出去（失败原因记在 lastSendError）
     func sendTo(_ c: DYIMConversation, text: String) async -> Bool {
-        guard await ensurePanel() else { return false }
-        guard let r = try? await web.eval(DYIMJS.open, ["name": c.name, "index": c.index], as: OKResp.self), r.ok else { return false }
+        lastSendError = nil
+        guard await ensurePanel() else { lastSendError = loggedIn ? "消息面板还没准备好，等几秒再试" : "抖音未登录"; return false }
+        guard let r = try? await web.eval(DYIMJS.open, ["name": c.name, "index": c.index], as: OKResp.self), r.ok else { lastSendError = "没找到 \(c.name) 的会话"; return false }
         let ok = await send(text)
+        if !ok { lastSendError = "网页没发出去，再试一次" }
         if let name = openName, name != c.name {
             // 回到用户原来开着的会话
             _ = try? await web.eval(DYIMJS.open, ["name": name, "index": -1], as: OKResp.self)
@@ -557,6 +618,23 @@ final class DYIMModel: ObservableObject {
         guard let r = try? await web.eval(DYIMJS.forward, ["box": m.box, "name": c.name], as: ActionResp.self) else { return false }
         return r.ok
     }
+}
+
+// MARK: - 通用：左边缘右滑 = 返回（只占最左边 24pt 的隐形条，不和列表滚动打架）
+
+struct DYEdgeSwipeBack: ViewModifier {
+    let action: () -> Void
+    func body(content: Content) -> some View {
+        content.overlay(alignment: .leading) {
+            Color.clear.frame(width: 24).contentShape(Rectangle())
+                .gesture(DragGesture(minimumDistance: 16).onEnded { v in
+                    if v.translation.width > 60 && abs(v.translation.height) < 90 { action() }
+                })
+        }
+    }
+}
+extension View {
+    func edgeSwipeBack(_ action: @escaping () -> Void) -> some View { modifier(DYEdgeSwipeBack(action: action)) }
 }
 
 // MARK: - 界面（照手机版抖音）
@@ -628,7 +706,7 @@ struct DYMessagesScreen: View {
                 }
             }
             .background(dyBG.ignoresSafeArea())
-            .gesture(DragGesture(minimumDistance: 24).onEnded { v in if v.startLocation.x < 44 && v.translation.width > 70 && abs(v.translation.height) < 80 { onClose() } })
+            .edgeSwipeBack { onClose() }
             .navigationDestination(item: $open) { c in
                 DYChatScreen(im: im, bridge: bridge, conversation: c, onBack: { open = nil }, onAuthor: onAuthor)
             }
@@ -684,6 +762,9 @@ struct DYChatScreen: View {
     @State private var menuFor: DYIMMessage?
     @State private var menuItems: [String] = []
     @State private var forwardMessage: DYIMMessage?
+    @State private var loadingOlder = false
+    @State private var olderExhausted = false
+    @State private var heartFor: Int?
     @FocusState private var focused: Bool
 
     var body: some View {
@@ -703,6 +784,9 @@ struct DYChatScreen: View {
             ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 10) {
+                        // 滑到最上面：让网页把更早的消息渲染出来
+                        Color.clear.frame(height: 1).onAppear { loadOlder(proxy) }
+                        if loadingOlder { ProgressView().tint(.white).padding(.vertical, 6) }
                         if im.chatLoading && im.messages.isEmpty { ProgressView().tint(.white).padding(.top, 40) }
                         ForEach(im.messages) { m in bubble(m).id(m.id) }
                         Color.clear.frame(height: 1).id("bottom")
@@ -711,7 +795,8 @@ struct DYChatScreen: View {
                 }
                 .scrollDismissesKeyboard(.interactively)
                 .onTapGesture { focused = false }
-                .onChange(of: im.messages.count) { _, _ in proxy.scrollTo("bottom", anchor: .bottom) }
+                // 只有最新一条变了才滚到底（往上翻历史时不打扰）
+                .onChange(of: im.messages.last?.id) { _, _ in if !loadingOlder { proxy.scrollTo("bottom", anchor: .bottom) } }
                 .onAppear { DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { proxy.scrollTo("bottom", anchor: .bottom) } }
             }
 
@@ -747,8 +832,7 @@ struct DYChatScreen: View {
         .background(dyBG.ignoresSafeArea())
         .navigationBarBackButtonHidden(true)
         .toolbar(.hidden, for: .navigationBar)
-        // 从左边缘右滑 = 返回（按钮太靠边手指不好点）
-        .gesture(DragGesture(minimumDistance: 24).onEnded { v in if v.startLocation.x < 44 && v.translation.width > 70 && abs(v.translation.height) < 80 { focused = false; onBack() } })
+        .edgeSwipeBack { focused = false; onBack() }
         .overlay(alignment: .top) {
             if let toast {
                 Text(toast).font(.footnote).foregroundStyle(.white).padding(.horizontal, 14).padding(.vertical, 8)
@@ -802,6 +886,26 @@ struct DYChatScreen: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) { if toast == s { toast = nil } }
     }
 
+    private func loadOlder(_ proxy: ScrollViewProxy) {
+        guard !loadingOlder, !olderExhausted, !im.messages.isEmpty else { return }
+        loadingOlder = true
+        let keep = im.messages.first?.id
+        let before = im.messages.count
+        Task {
+            _ = await im.loadOlder()
+            if im.messages.count <= before { olderExhausted = true }
+            // 保持原来看到的那条还在原位
+            if let keep { proxy.scrollTo(keep, anchor: .top) }
+            loadingOlder = false
+        }
+    }
+
+    private func likeCard(_ m: DYIMMessage) {
+        heartFor = m.id
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { if heartFor == m.id { heartFor = nil } }
+        Task { show(await im.likeCard(m)) }
+    }
+
     private func longPress(_ m: DYIMMessage) {
         guard m.kind != .time else { return }
         menuItems = []
@@ -837,7 +941,7 @@ struct DYChatScreen: View {
                 content(m)
                     .contentShape(Rectangle())
                     .simultaneousGesture(LongPressGesture(minimumDuration: 0.4).onEnded { _ in longPress(m) })
-                if !m.fromMe { Spacer(minLength: 50) }
+                if m.fromMe { avatar(m.avatar ?? im.myAvatar, size: 36) } else { Spacer(minLength: 50) }
             }
         }
     }
@@ -851,7 +955,8 @@ struct DYChatScreen: View {
                     CachedAsyncImage(url: m.cover.flatMap(URL.init(string:))) { img in img.resizable().scaledToFill() } placeholder: { dyBubble }
                         .frame(width: 150, height: 200).clipped()
                         .overlay {
-                            if opening == m.id { ProgressView().tint(.white) }
+                            if heartFor == m.id { Image(systemName: "heart.fill").font(.system(size: 56)).foregroundStyle(dyRed).transition(.scale) }
+                            else if opening == m.id { ProgressView().tint(.white) }
                             else { Image(systemName: "play.fill").font(.title).foregroundStyle(.white.opacity(0.85)) }
                         }
                     if let a = m.author, !a.isEmpty {
@@ -862,6 +967,8 @@ struct DYChatScreen: View {
                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             }
             .buttonStyle(.plain)
+            // 双击 = 点赞（抖音同款），单击才进视频
+            .highPriorityGesture(TapGesture(count: 2).onEnded { likeCard(m) })
         case .audio:
             HStack(spacing: 8) {
                 Image(systemName: "waveform").foregroundStyle(.white)

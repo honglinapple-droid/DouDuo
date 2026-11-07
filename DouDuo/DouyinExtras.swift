@@ -616,6 +616,7 @@ struct DYListPlayer: View {
             }
         }
         .statusBarHidden(true)
+        .edgeSwipeBack { dismiss() }
         .onChange(of: currentID) { old, new in
             if new == nil, let old { currentID = old; return }
             guard let i = items.firstIndex(where: { $0.id == new }) else { return }
@@ -730,6 +731,10 @@ struct DYSearchScreen: View {
     private var history: [String] { historyRaw.split(separator: "\n").map(String.init) }
 
     var body: some View {
+        screenBody.edgeSwipeBack { dismiss() }
+    }
+
+    private var screenBody: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
                 Button { dismiss() } label: {
@@ -814,7 +819,7 @@ struct DYSearchScreen: View {
             DYListPlayer(bridge: bridge, title: t.title, items: t.items, start: t.start,
                          loadMore: t.model.map { m in { await m.loadMore() } }, onAuthor: onAuthor)
         }
-    }
+        }
 
     private func run(_ word: String) {
         let w = word.trimmingCharacters(in: .whitespaces)
@@ -896,6 +901,10 @@ struct DYMineScreen: View {
     @State private var open: DYListTarget?
 
     var body: some View {
+        screenBody.edgeSwipeBack { dismiss() }
+    }
+
+    private var screenBody: some View {
         VStack(spacing: 0) {
             HStack {
                 Button { dismiss() } label: {
@@ -943,7 +952,7 @@ struct DYMineScreen: View {
             DYListPlayer(bridge: bridge, title: t.title, items: t.items, start: t.start,
                          loadMore: t.model.map { m in { await m.loadMore() } }, onAuthor: onAuthor)
         }
-    }
+        }
 
     private func ensure(_ k: DYListKind) {
         guard models[k] == nil else { return }
@@ -1020,6 +1029,10 @@ struct DYAuthorScreen: View {
     @State private var err: String?
 
     var body: some View {
+        screenBody.edgeSwipeBack { dismiss() }
+    }
+
+    private var screenBody: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
                 Button { dismiss() } label: {
@@ -1056,7 +1069,7 @@ struct DYAuthorScreen: View {
             guard let s = author.secUid else { err = "没有作者信息"; return }
             do { user = try await bridge.userProfile(s) } catch { err = error.localizedDescription }
         }
-    }
+        }
 }
 
 // MARK: - 关注流
@@ -1064,6 +1077,8 @@ struct DYAuthorScreen: View {
 struct DYFollowFeed: View {
     let bridge: DouyinBridge
     let insets: EdgeInsets
+    /// 外面每加一就重新拉一遍（顶栏再点一次「关注」）
+    var refresh: Int = 0
     let active: Bool
     let onAuthor: (DYAweme) -> Void
     let onLogin: () -> Void
@@ -1128,6 +1143,11 @@ struct DYFollowFeed: View {
         .task {
             if m.items.isEmpty { await m.loadMore() }
             if currentID == nil { currentID = m.items.first?.id }
+        }
+        .onChange(of: refresh) { _, _ in
+            onToast?("正在刷新关注…")
+            preloader.clear(); m.reset(); currentID = nil
+            Task { await m.loadMore(); currentID = m.items.first?.id; onToast?(m.items.isEmpty ? (m.error ?? "关注的人还没有新作品") : "关注已刷新") }
         }
         .onChange(of: currentID) { old, new in
             if new == nil, let old, m.items.contains(where: { $0.id == old }) { currentID = old; return }

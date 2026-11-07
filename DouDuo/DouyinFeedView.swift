@@ -30,6 +30,8 @@ struct DYAweme: Identifiable, Codable, Equatable {
     let isCollect: Int?
     /// 0=视频 68=图文；上报观看时要带
     var awemeType: Int? = nil
+    /// 发布时间（秒）
+    var createTime: Double? = nil
     /// 封面宽高：接口里视频宽高偶尔标错，用封面再核一遍
     var coverW: Double? = nil
     var coverH: Double? = nil
@@ -505,6 +507,7 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
         coverH: (v.cover && v.cover.height) || (v.origin_cover && v.origin_cover.height) || 0,
         stats: { digg: st.digg_count || 0, comment: st.comment_count || 0, collect: st.collect_count || 0, share: st.share_count || 0 },
         music: (a.music && a.music.title) || '',
+        createTime: a.create_time || 0,
         userDigged: a.user_digged ? 1 : 0,
         isCollect: (a.is_collect || a.is_collected || (a.collect_stat === 1)) ? 1 : 0
       };
@@ -797,8 +800,11 @@ struct DouyinFeedScreen: View {
     /// 防误触：进度条贴底后，底边上滑第一下先给 App（拖进度条），连划两下才回桌面
     @AppStorage("douyin_defer_bottom_gesture_v1") private var deferBottomGesture = true
     /// 刷新提速：后台提前拼好的「下一批」，点刷新直接换上，不等网络
-    @State private var nextBatch: DYFeedModel?
+    @State private var nextBatches: [DYFeedModel] = []     // 常备两批
     @State private var preparingNext = false
+    @State private var pendingRefresh = false
+    @State private var followRefresh = 0
+    @State private var narrow = false
     /// 隔离模式：不把播放/观看记录和「不感兴趣」报给抖音，所有学习只在手机本地，不影响手机正版抖音的推荐
     @AppStorage("douyin_isolation_v1") private var isolation = true
     @State private var showScreenInfo = false
@@ -846,8 +852,9 @@ struct DouyinFeedScreen: View {
                 }
             }
             .background(theme.media.strongScrim.color(for: scheme).ignoresSafeArea())
-            .onAppear { insets = geo.safeAreaInsets }
+            .onAppear { insets = geo.safeAreaInsets; narrow = geo.size.width < 520 }
             .onChange(of: geo.safeAreaInsets) { _, v in insets = v }
+            .onChange(of: geo.size.width) { _, w in narrow = w < 520 }
             .sheet(isPresented: Binding(get: { showComments && !wide }, set: { showComments = $0 })) {
                 if let cur = current {
                     DYCommentPanel(bridge: bridge, aweme: cur, onClose: { showComments = false })
@@ -951,7 +958,7 @@ struct DouyinFeedScreen: View {
         .onChange(of: cacheCount) { _, _ in focusCurrent() }
         .onChange(of: currentID) { _, _ in if tab == .recommend { scheduleNextBatch() } }
         .onChange(of: feed.portraitMode) { _, _ in
-            nextBatch = nil
+            nextBatches = []
             preloader.clear(); feed.reset(); currentID = nil
             Task { await feed.loadMore(bridge); currentID = feed.items.first?.id; focusCurrent() }
         }
@@ -996,6 +1003,8 @@ struct DouyinFeedScreen: View {
         if target == .messages { showMessages = true; return }
         if tab == .recommend && target == .recommend {
             Task { await refreshRecommendations() }
+        } else if tab == .follow && target == .follow {
+            followRefresh += 1   // 再点一次「关注」= 刷新关注列表
         } else {
             tab = target
         }
@@ -1003,17 +1012,19 @@ struct DouyinFeedScreen: View {
 
     /// 先拉到新一批再替换，失败不清空当前画面；与预取互斥，避免旧请求覆盖刷新结果。
     @MainActor private func refreshRecommendations() async {
-        guard !refreshing else { return }
+        guard !refreshing else { pendingRefresh = true; return }   // 刷新中再点：记下来，完了自动再刷一次
         refreshing = true
-        defer { refreshing = false; focusCurrent() }
+        defer {
+            refreshing = false; focusCurrent()
+            if pendingRefresh { pendingRefresh = false; Task { await refreshRecommendations() } }
+        }
         let previous = Set(feed.items.map(\.id))
         var replacement: DYFeedModel
         var instant = false
-        if let nb = nextBatch, !nb.items.filter({ !previous.contains($0.id) }).isEmpty {
+        if let i = nextBatches.firstIndex(where: { !$0.items.filter({ !previous.contains($0.id) }).isEmpty }) {
             // 后台早就备好了：直接换，不等网络
-            replacement = nb; instant = true
+            replacement = nextBatches.remove(at: i); instant = true
         } else {
-            showToast("正在刷新推荐…")
             while feed.loading {
                 do { try await Task.sleep(nanoseconds: 100_000_000) }
                 catch { return }
@@ -1021,11 +1032,10 @@ struct DouyinFeedScreen: View {
             guard !Task.isCancelled else { return }
             replacement = DYFeedModel()
             replacement.followed = feed.followed
-            // 第一条到手就先换上，后面的在后台继续补
-            await replacement.loadMore(bridge, want: 1)
+            // 凑够 4 条再换，不再边塞边播（边塞边播画面会一跳一跳）
+            await replacement.loadMore(bridge, want: 4)
             guard !Task.isCancelled else { return }
         }
-        nextBatch = nil
         let fresh = replacement.items.filter { !previous.contains($0.id) }
         guard !fresh.isEmpty else {
             showToast(replacement.error ?? "暂时没有新的推荐，已保留当前视频")
@@ -1045,30 +1055,35 @@ struct DouyinFeedScreen: View {
         resume = [:]
         currentID = fresh.first?.id
         scrollID = currentID
+        // 强制回到第一条（列表刚换完这一帧 scrollPosition 有时不生效，下一帧再设一次）
+        let first = fresh.first?.id
+        DispatchQueue.main.async { scrollID = first; currentID = first }
         lastFeedPull = Date()
         saveSession()
-        showToast(instant ? "推荐已刷新" : "推荐已刷新，后面的继续加载…")
+        showToast("推荐已刷新")
         DYLiveModel.log("DDREFRESH ok n=\(fresh.count) first=\(currentID ?? "-") instant=\(instant)")
-        if fresh.count < 6 { Task { await feed.loadMore(bridge); focusCurrent() } }
         scheduleNextBatch()
     }
 
     /// 看了一会儿之后，在后台悄悄把下一批拼好、第一条预加载好
+    /// 后台常备两批：第一条视频起来 1.5 秒后开始备，备到两批为止；换掉一批马上补
     private func scheduleNextBatch() {
-        guard nextBatch == nil, !preparingNext else { return }
+        guard nextBatches.count < 2, !preparingNext else { return }
         preparingNext = true
         Task {
-            try? await Task.sleep(nanoseconds: 6_000_000_000)
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
             defer { preparingNext = false }
-            guard nextBatch == nil, !refreshing, !feed.items.isEmpty else { return }
-            let m = DYFeedModel()
-            m.followed = feed.followed
-            await m.loadMore(bridge, want: 4)
-            let seen = Set(feed.items.map(\.id))
-            m.items.removeAll { seen.contains($0.id) }
-            guard !m.items.isEmpty else { return }
-            nextBatch = m
-            if let first = m.items.first { preloader.warm(first) }
+            while nextBatches.count < 2 {
+                guard !refreshing, !feed.items.isEmpty else { break }
+                let m = DYFeedModel()
+                m.followed = feed.followed
+                await m.loadMore(bridge, want: 4)
+                let seen = Set(feed.items.map(\.id)).union(nextBatches.flatMap { $0.items.map(\.id) })
+                m.items.removeAll { seen.contains($0.id) }
+                guard !m.items.isEmpty else { break }
+                nextBatches.append(m)
+                if let first = m.items.first { preloader.warm(first) }
+            }
         }
     }
 
@@ -1102,7 +1117,7 @@ struct DouyinFeedScreen: View {
             if tab == .live {
                 DYLiveFeed(bridge: bridge, model: live, onWeb: { u in web = DYWebTarget(url: u) })
             } else if tab == .follow {
-                DYFollowFeed(bridge: bridge, insets: insets, active: tab == .follow && web == nil && !showSearch && !showMine,
+                DYFollowFeed(bridge: bridge, insets: insets, refresh: followRefresh, active: tab == .follow && web == nil && !showSearch && !showMine,
                              onAuthor: { a in authorTarget = a.author },
                              onLogin: { web = DYWebTarget(url: DouyinWeb.home) },
                              onToast: { showToast($0) })
@@ -1135,7 +1150,8 @@ struct DouyinFeedScreen: View {
         }
         .sheet(item: $shareTarget) { a in
             DYFriendPicker(im: im, title: "发送给朋友") { friend in
-                Task { if await im.sendTo(friend, text: a.webURL.absoluteString) { showToast("已发给 \(friend.name)") } else { showToast("没发出去，看看是否已登录") } }
+                showToast("发送中…")
+                Task { if await im.sendTo(friend, text: a.webURL.absoluteString) { showToast("已发给 \(friend.name)") } else { showToast(im.lastSendError ?? "没发出去") } }
             }
             .presentationDetents([.medium, .large])
             .presentationBackground(Color(red: 0.12, green: 0.12, blue: 0.13))
@@ -1168,18 +1184,19 @@ struct DouyinFeedScreen: View {
 
     /// 顶部一排：左菜单，中间 关注/推荐/直播，右边 搜索 / 我的
     private var topBar: some View {
-        HStack(spacing: 0) {
-            menuButton
-            Spacer(minLength: 6)
+        HStack(alignment: .center, spacing: 0) {
+            menuButton.frame(width: 40, height: 40)
+            Spacer(minLength: 4)
             tabSwitcher
-            Spacer(minLength: 6)
-            HStack(spacing: 6) {
+            Spacer(minLength: 4)
+            HStack(spacing: narrow ? 0 : 6) {
                 topIcon("magnifyingglass", "douyin.search") { showSearch = true }
                 topIcon("person.crop.circle", "douyin.mine") { showMine = true }
             }
         }
+        .frame(height: 40)
         // 屏幕是圆角：两边留够，图标别被圆角裁掉（Duo 横屏尤其明显）
-        .padding(.horizontal, 24)
+        .padding(.horizontal, narrow ? 14 : 24)
     }
 
     private func topIcon(_ name: String, _ id: String, _ act: @escaping () -> Void) -> some View {
@@ -1198,15 +1215,22 @@ struct DouyinFeedScreen: View {
     /// 顶部「关注 / 推荐 / 直播」切换（抖音顶栏同款位置）
     private var tabSwitcher: some View {
         let fg = theme.media.onMedia.color(for: scheme)
-        return HStack(spacing: 18) {
+        // 外屏（466pt 宽）字小一号、间距收紧；所有项目统一 40pt 高、垂直居中，下划线做成 overlay 不占高度
+        let font: Font = narrow ? .subheadline : .headline
+        return HStack(spacing: narrow ? 12 : 18) {
             ForEach(DYTab.allCases, id: \.self) { t in
                 Button { selectTab(t) } label: {
-                    VStack(spacing: 4) {
-                        Text(t.title)
-                            .font(.headline.weight(tab == t ? .bold : .medium))
-                            .foregroundStyle(fg.opacity(tab == t ? 1 : 0.6))
-                        Capsule().fill(fg).frame(width: 18, height: 3).opacity(tab == t ? 1 : 0)
-                    }
+                    Text(t.title)
+                        .font(font.weight(tab == t ? .bold : .medium))
+                        .foregroundStyle(fg.opacity(tab == t ? 1 : 0.6))
+                        .frame(height: 40)
+                        .overlay(alignment: .bottom) {
+                            if tab == t {
+                                if refreshing && t == .recommend { ProgressView().tint(fg).scaleEffect(0.6).offset(y: 2) }
+                                else { Capsule().fill(fg).frame(width: 18, height: 3).offset(y: -4) }
+                            }
+                        }
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
             }
@@ -2046,10 +2070,16 @@ struct DYVideoPage: View {
 
     private func info(_ fg: Color) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Button(action: onAuthor) {
-                Text("@" + item.author.name).font(.headline).foregroundStyle(fg)
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Button(action: onAuthor) {
+                    Text("@" + item.author.name).font(.headline).foregroundStyle(fg)
+                }
+                .buttonStyle(.plain)
+                // 发布时间（抖音同款：作者名旁边）
+                if let t = item.createTime, t > 0 {
+                    Text("· " + DYFormat.time(t)).font(.footnote).foregroundStyle(fg.opacity(0.75))
+                }
             }
-            .buttonStyle(.plain)
             if !item.desc.isEmpty {
                 Text(item.desc)
                     .font(.subheadline)
@@ -2183,6 +2213,10 @@ struct DYCommentPanel: View {
     }
 
     var body: some View {
+        panelBody.edgeSwipeBack { onClose?() }
+    }
+
+    private var panelBody: some View {
         VStack(spacing: 0) {
             HStack {
                 Text(total > 0 ? "\(DYFormat.count(total)) 条评论" : "评论").font(.subheadline.weight(.semibold))
