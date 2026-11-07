@@ -1692,12 +1692,15 @@ struct DYVideoPage: View {
 
             // 文案 / 右侧按钮栏压在播放器底部进度条上方（进度条 + 拖动条约 70pt）
             HStack(alignment: .bottom, spacing: 12) {
+                // 视频的文案沉底（紧贴进度条）；图集没有进度条且底部有分页圆点，维持原位
                 info(fg)
+                    .padding(.bottom, item.images.isEmpty ? PlayerPage.captionBottomGap : max(insets.bottom, 18) + 24)
                 Spacer(minLength: 0)
+                // 右侧按钮栏位置不动
                 actions(fg)
+                    .padding(.bottom, max(insets.bottom, 18) + (item.images.isEmpty ? 92 : 24))
             }
             .padding(.horizontal, 12)
-            .padding(.bottom, max(insets.bottom, 18) + (item.images.isEmpty ? 92 : 24))   // 让开底部时间 + 进度条 + 拖动区
         }
         .overlay(alignment: .bottom) {
             if showDanmakuInput { danmakuBar.padding(.bottom, max(insets.bottom, 12) + 6) }
