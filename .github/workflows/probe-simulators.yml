@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   probe:
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 20
     steps:
       - name: Xcode and simulator inventory
@@ -44,9 +44,11 @@ jobs:
           xcrun simctl boot "$UDID"; xcrun simctl bootstatus "$UDID" -b
           sleep 10
           xcrun simctl io "$UDID" screenshot out/duo-portrait.png
-          xcrun simctl ui "$UDID" --help 2>&1 | head -40
-          for a in fold unfold; do xcrun simctl ui "$UDID" $a 2>&1 | head -5; done
+          xcrun simctl ui "$UDID" --help 2>&1 | head -60
+          xcrun simctl ui "$UDID" posture 2>&1 | head -5
+          for a in "posture folded" "posture unfolded" "fold" "unfold"; do echo ">> $a"; xcrun simctl ui "$UDID" $a 2>&1 | head -3; done
           xcrun simctl io "$UDID" screenshot out/duo-after-toggle.png 2>/dev/null
+          echo "=== device plist ==="; plutil -p "$HOME/Library/Developer/CoreSimulator/Devices/$UDID/device.plist" 2>/dev/null | head -30
           sips -g pixelWidth -g pixelHeight out/*.png
           xcrun simctl shutdown "$UDID"
       - uses: actions/upload-artifact@v4
