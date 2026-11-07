@@ -231,6 +231,60 @@ final class DouDuoUITests: XCTestCase {
     }
 
     /// 底部进度条左侧时间（秒）
+
+    // MARK: - b44 内测
+
+    /// 长按 2 倍速期间手指漂移不能变成拖进度（防误触）。本地 30 秒测试片：
+    /// 按住 1 秒 → 慢慢向右拖到 80% 宽 → 再按 2 秒。没防住的话会被当成横滑快进，进度一下跳十几秒。
+    func testLongPressLocksSeek() throws {
+        let app = XCUIApplication()
+        let media = ProcessInfo.processInfo.environment["DOUDUO_MEDIA"] ?? ""
+        app.launchEnvironment["DOUDUO_LOCALVIDEO"] = media.isEmpty ? "narrow.mp4" : media + "/narrow.mp4"
+        app.launch()
+        sleep(5)
+        let t0 = playTime(app)
+        XCTAssertGreaterThan(t0, 0, "本地片没在播")
+        attach(app, "lp-0-before")
+        let start = app.coordinate(withNormalizedOffset: CGVector(dx: 0.3, dy: 0.45))
+        let end = app.coordinate(withNormalizedOffset: CGVector(dx: 0.8, dy: 0.45))
+        start.press(forDuration: 1.0, thenDragTo: end, withVelocity: .slow, thenHoldForDuration: 2.0)
+        sleep(1)
+        let t1 = playTime(app)
+        attach(app, "lp-1-after")
+        print("DDTEST longpress \(t0) -> \(t1)")
+        // 全程约 5 秒真实时间，大半在 2 倍速：进度应走 5–12 秒；被当成拖进度会额外跳 +13 秒
+        XCTAssertGreaterThanOrEqual(t1 - t0, 4, "长按后视频没在走")
+        XCTAssertLessThan(t1 - t0, 15, "长按期间横向漂移被当成了拖进度")
+        // 松手后进度条和时间应该回来
+        XCTAssertTrue(app.staticTexts.matching(NSPredicate(format: "label MATCHES '^[0-9]+:[0-9][0-9]$'")).count > 0, "松手后进度条没恢复")
+    }
+
+    /// 推荐流连滑 8 条：每条都要能切、不能卡死在同一条、不能出现「加载失败」
+    func testFeedScrollSmoke() throws {
+        let app = XCUIApplication()
+        app.launch()
+        let current = app.staticTexts["douyin.currentID"]
+        XCTAssertTrue(current.waitForExistence(timeout: 30))
+        XCTAssertEqual(XCTWaiter().wait(for: [expectation(for: NSPredicate(format: "label != '-'"), evaluatedWith: current)], timeout: 90), .completed, "推荐流没加载出来")
+        sleep(5)
+        var seen: [String] = [current.label]
+        var stuck = 0
+        for i in 0..<8 {
+            let before = current.label
+            app.swipeUp(velocity: .fast)
+            sleep(3)
+            let after = current.label
+            if after == before { stuck += 1; print("DDTEST swipe \(i) stuck at \(before)") } else { seen.append(after) }
+            if i == 3 { attach(app, "scroll-mid") }
+        }
+        attach(app, "scroll-end")
+        print("DDTEST scroll changed=\(seen.count - 1) stuck=\(stuck) ids=\(seen)")
+        XCTAssertLessThanOrEqual(stuck, 2, "8 次上滑有 \(stuck) 次没切成（列表断货 / 卡死）")
+        XCTAssertFalse(app.staticTexts["这条加载失败，上滑看下一条"].exists, "出现了加载失败提示")
+        sleep(3)
+        XCTAssertGreaterThan(playTime(app), 0, "连滑后最后一条没在播")
+    }
+
     private func playTime(_ app: XCUIApplication) -> Int {
         let q = app.staticTexts.matching(NSPredicate(format: "label MATCHES '^[0-9]+:[0-9][0-9]$'"))
         guard q.count > 0 else { return 0 }

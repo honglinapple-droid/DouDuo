@@ -1,4 +1,5 @@
-// 本地视频缓存：推荐流播放时，后台把后面 N 条（默认 50）完整下载到 Caches/dd-videos/。
+// 本地视频缓存：推荐流播放时，后台把后面几条完整下载到 Caches/dd-videos/（磁盘上最多留 N 条，默认 50）。
+// b44：同时只下 1 条、只下当前后面 5 条以内——之前 2 条并发一路下到 50 条，和正在播的视频、推荐接口抢网络
 // - 下滑到已缓存的条目直接播本地文件，不等网络
 // - 下次打开 App 先播「已缓存、还没看过」的，连接抖音放到后台
 // - 超过上限先删看过的、再删最早的
@@ -95,12 +96,12 @@ actor DYVideoCache {
         let lim = Self.limit
         guard lim > 0 else { queue = []; return }
         let have = Set(entries.map(\.aweme.id))
-        queue = ahead.prefix(lim).filter { a in
+        queue = ahead.prefix(min(lim, 5)).filter { a in
             a.images.isEmpty && a.play != nil && a.duration <= Self.maxDuration
                 && !have.contains(a.id) && !active.contains(a.id) && !failed.contains(a.id)
         }
         // 图文：图片走图片缓存
-        for a in ahead.prefix(lim) where !a.images.isEmpty {
+        for a in ahead.prefix(min(lim, 5)) where !a.images.isEmpty {
             for s in a.images.prefix(9) { if let u = URL(string: s) { Task { _ = await ImageCache.shared.load(u) } } }
         }
         pump()
@@ -129,7 +130,7 @@ actor DYVideoCache {
     // MARK: 下载
 
     private func pump() {
-        while active.count < 2, !queue.isEmpty {
+        while active.count < 1, !queue.isEmpty {
             let a = queue.removeFirst()
             guard let s = a.play, let u = URL(string: s) else { continue }
             active.insert(a.id)

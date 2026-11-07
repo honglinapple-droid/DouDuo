@@ -184,6 +184,15 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
     }
 
     private var refreshIndex = 1
+    /// 重接口（推荐 / 关注 / 相关推荐：一页回包 2–3 MB、要 3–4 秒）串行：同一时刻只飞一个。
+    /// 之前刷新后 5–6 个一起发，把手机网络挤满——视频起不来、列表也补不上，就是"卡死 + 黑屏"的根子
+    private var heavyChain: Task<Void, Never>?
+    func serialized<T>(_ op: @escaping @MainActor () async throws -> T) async throws -> T {
+        let prev = heavyChain
+        let t = Task<T, Error> { await prev?.value; return try await op() }
+        heavyChain = Task { _ = try? await t.value }
+        return try await t.value
+    }
     /// 首次安装时间要固定：以前每次请求都用「现在-15分钟」，服务端会当成刚装的新设备，推荐偏冷启动内容
     static let installTime: Int = {
         let k = "douyin_install_time_v1"
@@ -218,6 +227,9 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
     """
 
     func fetchFeed() async throws -> (items: [DYAweme], hasMore: Bool) {
+        try await serialized { try await self.fetchFeedNow() }
+    }
+    private func fetchFeedNow() async throws -> (items: [DYAweme], hasMore: Bool) {
         refreshIndex += 1
         let d = try await call(Self.feedJS, args: ["refresh": String(refreshIndex),
                                                    "install": String(Self.installTime),
@@ -849,6 +861,9 @@ struct DouyinFeedScreen: View {
     @State private var initialized = false
     @State private var refreshing = false
     @State private var showComments = false
+    /// 当前条正在长按 2 倍速：顶栏跟着藏起来（沉浸）
+    @State private var boosting = false
+    @State private var saveTask: Task<Void, Never>?
     @State private var web: DYWebTarget?
     @State private var tab: DYTab = ProcessInfo.processInfo.environment["DOUDUO_STARTLIVE"] == "1" ? .live : .recommend
     @StateObject private var live = DYLiveModel()
@@ -981,7 +996,7 @@ struct DouyinFeedScreen: View {
             reportWatch(old: old, new: new)
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
-            saveSession()
+            saveSession(now: true)
         }
         .onReceive(Timer.publish(every: 5, on: .main, in: .common).autoconnect()) { _ in
             if DDPlayback.shared.appIsActive { saveSession() }
@@ -1041,13 +1056,23 @@ struct DouyinFeedScreen: View {
         }
     }
 
-    private func saveSession() {
-        guard let id = currentID, feed.items.contains(where: { $0.id == id }) else { return }
+    /// 存会话：只存当前前后各 30 条，2 秒内多次只存最后一次，编码写盘在后台。
+    /// （之前每划一条都在主线程把整张列表——看久了几百条——序列化一遍，还一划触发两三次，是越待越卡的来源之一）
+    private func saveSession(now: Bool = false) {
+        guard let id = currentID, let i = currentIndex else { return }
         var positions = resume
         if DDNowPlaying.id == id, DDNowPlaying.time.isFinite {
             positions[id] = max(0, DDNowPlaying.time)
         }
-        DYFeedSession(items: feed.items, currentID: id, positions: positions).save()
+        let lo = max(0, i - 30), hi = min(feed.items.count - 1, i + 30)
+        let snap = DYFeedSession(items: Array(feed.items[lo...hi]), currentID: id, positions: positions)
+        saveTask?.cancel()
+        if now { snap.save(); return }
+        saveTask = Task.detached(priority: .utility) {
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard !Task.isCancelled else { return }
+            snap.save()
+        }
     }
 
     private func selectTab(_ target: DYTab) {
@@ -1127,7 +1152,8 @@ struct DouyinFeedScreen: View {
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             defer { preparingNext = false }
             while nextBatches.count < 1 {
-                guard !refreshing, !feed.items.isEmpty else { break }
+                // 只在空闲时备批：主线没在拉、后面已经备够 10 条（否则和主线抢那条 3 MB 的请求）
+                guard !refreshing, !feed.loading, let i = currentIndex, feed.items.count - i - 1 >= 10 else { break }
                 let m = DYFeedModel()
                 m.followed = feed.followed
                 await m.loadMore(bridge, want: 6)
@@ -1178,6 +1204,9 @@ struct DouyinFeedScreen: View {
                 recommendArea
             }
             topBar.padding(.top, 10)
+                .opacity(boosting ? 0 : 1)
+                .allowsHitTesting(!boosting)
+                .animation(.easeInOut(duration: 0.2), value: boosting)
             if let t = feed.toast {
                 Text(t).font(.footnote.weight(.medium)).foregroundStyle(.white)
                     .padding(.horizontal, 14).padding(.vertical, 8)
@@ -1336,7 +1365,8 @@ struct DouyinFeedScreen: View {
                                         onDislike: { dislike(item.id) },
                                         followed: item.author.secUid.map { feed.followed.contains($0) } ?? false,
                                         onFollow: { follow(item.author) },
-                                        onShare: { shareTarget = item })
+                                        onShare: { shareTarget = item },
+                                        onBoost: { boosting = $0 })
                             .containerRelativeFrame([.horizontal, .vertical])
                             .id(item.id)
                         }
@@ -1605,15 +1635,19 @@ final class DYLiveModel: ObservableObject {
     private var sizeObs: AnyCancellable?
 
     /// 直播日志：Release 也要能用（ddWrite 只在 DEBUG 编译），排查真机「有声无画」靠它
+    private static let logQueue = DispatchQueue(label: "douduo.log", qos: .utility)
     nonisolated static func log(_ s: String) {
-        guard let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
-        let url = dir.appendingPathComponent("ddlog.txt")
-        let df = DateFormatter(); df.dateFormat = "HH:mm:ss"
-        let line = df.string(from: Date()) + " " + s + "\n"
-        if let h = try? FileHandle(forWritingTo: url) {
-            h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close()
-        } else {
-            try? line.write(to: url, atomically: true, encoding: .utf8)
+        let at = Date()
+        logQueue.async {
+            guard let dir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first else { return }
+            let url = dir.appendingPathComponent("ddlog.txt")
+            let df = DateFormatter(); df.dateFormat = "HH:mm:ss"
+            let line = df.string(from: at) + " " + s + "\n"
+            if let h = try? FileHandle(forWritingTo: url) {
+                h.seekToEndOfFile(); h.write(Data(line.utf8)); try? h.close()
+            } else {
+                try? line.write(to: url, atomically: true, encoding: .utf8)
+            }
         }
     }
 
@@ -1968,7 +2002,11 @@ struct DYVideoPage: View {
     let onFollow: (() -> Void)?
     /// 分享给朋友（nil = 用系统分享）
     let onShare: (() -> Void)?
+    /// 长按 2 倍速进 / 出（外层藏顶栏用）
+    let onBoost: ((Bool) -> Void)?
     @State private var heart = false
+    /// 正在 2 倍速：文案和右侧按钮淡出（沉浸）
+    @State private var boosting = false
     @State private var descExpanded = false
     @State private var danmaku: [DYDanmaku] = []
     @State private var danmakuLoaded = false
@@ -1984,8 +2022,9 @@ struct DYVideoPage: View {
          onLike: @escaping () -> Void, onCollect: @escaping () -> Void, onDoubleTap: @escaping () -> Void,
          onComments: @escaping () -> Void, onAuthor: @escaping () -> Void, onSavePosition: @escaping (Double) -> Void,
          preloader: DYPreloader, bridge: DouyinBridge? = nil, onToast: ((String) -> Void)? = nil,
-         onDislike: (() -> Void)? = nil, followed: Bool = false, onFollow: (() -> Void)? = nil, onShare: (() -> Void)? = nil) {
-        self.followed = followed; self.onFollow = onFollow; self.onShare = onShare
+         onDislike: (() -> Void)? = nil, followed: Bool = false, onFollow: (() -> Void)? = nil, onShare: (() -> Void)? = nil,
+         onBoost: ((Bool) -> Void)? = nil) {
+        self.followed = followed; self.onFollow = onFollow; self.onShare = onShare; self.onBoost = onBoost
         self.item = item; self.isCurrent = isCurrent; self.insets = insets; self.resume = resume
         self.liked = liked; self.collected = collected
         self.onLike = onLike; self.onCollect = onCollect; self.onDoubleTap = onDoubleTap
@@ -2005,6 +2044,10 @@ struct DYVideoPage: View {
                                     resumePosition: resume, compactChrome: true,
                                     preparedPlayer: { preloader.take(item.id) },
                                     parkPlayer: { preloader.park($0, $1) },
+                                    onRateBoost: { on in
+                                        withAnimation(.easeInOut(duration: 0.2)) { boosting = on }
+                                        onBoost?(on)
+                                    },
                                     onEnded: nil,
                                     onDoubleTap: {
                                         onDoubleTap()
@@ -2043,6 +2086,9 @@ struct DYVideoPage: View {
                     .padding(.bottom, max(insets.bottom, 18) + (item.images.isEmpty ? 92 : 24))
             }
             .padding(.horizontal, 12)
+            // 2 倍速期间文案和按钮全藏（抖音同款沉浸），松手恢复
+            .opacity(boosting ? 0 : 1)
+            .allowsHitTesting(!boosting)
         }
         .overlay(alignment: .bottom) {
             if showDanmakuInput { danmakuBar.padding(.bottom, max(insets.bottom, 12) + 6) }
@@ -2051,7 +2097,8 @@ struct DYVideoPage: View {
         .onChange(of: isCurrent) { _, c in if !c { showDanmakuInput = false } }
         // 弹幕：轮到这条时才拉（一次拉整条视频的）
         .task(id: isCurrent) {
-            guard isCurrent, !danmakuLoaded, item.images.isEmpty, let b = bridge else { return }
+            // 弹幕关着就不拉（之前每切一条都发一个请求，白占签名页）
+            guard isCurrent, danmakuOn, !danmakuLoaded, item.images.isEmpty, let b = bridge else { return }
             danmakuLoaded = true
             do {
                 danmaku = try await b.danmaku(item.id, durationMs: Int(item.duration * 1000))

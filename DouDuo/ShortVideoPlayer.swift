@@ -78,11 +78,13 @@ extension PlayerPage {
                          compactChrome: Bool,
                          preparedPlayer: (() -> AVPlayer?)? = nil,
                          parkPlayer: ((String, AVPlayer) -> Void)? = nil,
+                         onRateBoost: ((Bool) -> Void)? = nil,
                          onEnded: (() -> Void)?, onDoubleTap: (() -> Void)?,
                          onSavePosition: @escaping (Double) -> Void, onClose: @escaping () -> Void,
                          fillWidth: Bool = true, danmaku: [DYDanmaku] = []) -> PlayerPage {
         PlayerPage(id: id, url: url, knownDuration: durationSec, isActive: isActive, bottomInset: bottomInset,
-                   resumePosition: resumePosition, preparedPlayer: preparedPlayer, parkPlayer: parkPlayer, onEnded: onEnded,
+                   resumePosition: resumePosition, preparedPlayer: preparedPlayer, parkPlayer: parkPlayer,
+                   onRateBoost: onRateBoost, onEnded: onEnded,
                    onDoubleTap: onDoubleTap, onSavePosition: onSavePosition, fillWidth: fillWidth,
                    topInset: topInset, danmaku: danmaku)
     }
@@ -103,6 +105,8 @@ struct PlayerPage: View {
     let preparedPlayer: (() -> AVPlayer?)?
     /// 页面滑走时把播放器停放出去（不销毁），滑回来接着播。nil = 原来的销毁逻辑
     var parkPlayer: ((String, AVPlayer) -> Void)? = nil
+    /// 2 倍速进 / 出的通知：外层据此把文案、按钮、顶栏藏起来（沉浸），松手恢复
+    var onRateBoost: ((Bool) -> Void)? = nil
     let onEnded: (() -> Void)?
     let onDoubleTap: (() -> Void)?
     let onSavePosition: (Double) -> Void
@@ -183,7 +187,8 @@ struct PlayerPage: View {
         }
         .overlay(alignment: .bottom) {
             // 贴着物理屏幕底边摆：不管外层容器有没有让开安全区（折叠屏/iPad 布局下可能没有），都忽略
-            if isActive { progressBar.padding(.bottom, Self.barBottomGap).ignoresSafeArea(edges: .bottom) }
+            // 2 倍速期间进度条也收起来（沉浸），底部 40pt 拖动区随之停用
+            if isActive && !rateBoost { progressBar.padding(.bottom, Self.barBottomGap).ignoresSafeArea(edges: .bottom).transition(.opacity) }
         }
         .ignoresSafeArea(edges: .bottom)
         .onAppear {
@@ -205,6 +210,7 @@ struct PlayerPage: View {
             resumeAfterBackground()
         }
         .onChange(of: isActive) { _, active in
+            if !active, rateBoost { setBoost(false) }   // 滑走时还按着：2 倍速状态清掉，外层恢复
             if let v = vlc {
                 if active { v.mediaPlayer.audio?.isMuted = false; v.mediaPlayer.play(); isPlaying = true }
                 else { v.mediaPlayer.pause(); isPlaying = false; onSavePosition(v.current) }
@@ -232,12 +238,12 @@ struct PlayerPage: View {
             onDoubleTap: { _, _ in onDoubleTap?() },
             onLongPress: { pressing in
                 if let v = vlc {
-                    if pressing { v.setRate(2); rateBoost = true } else if rateBoost { v.setRate(1); rateBoost = false }
+                    if pressing { v.setRate(2); setBoost(true) } else if rateBoost { v.setRate(1); setBoost(false) }
                     return
                 }
                 guard let p = player else { return }
-                if pressing { p.rate = 2; rateBoost = true }
-                else if rateBoost { p.rate = isPlaying ? 1 : 0; rateBoost = false }
+                if pressing { p.rate = 2; setBoost(true) }
+                else if rateBoost { p.rate = isPlaying ? 1 : 0; setBoost(false) }
             },
             onSeekBegan: {
                 guard duration > 0 else { return }
@@ -378,15 +384,30 @@ struct PlayerPage: View {
         #endif
     }
 
-    /// 起播看门狗：当前屏 3 秒还没走（网络抖 / 预加载的 item 失效），重建播放项再来一次
-    /// （原来 6 秒，用户反馈黑屏等太久，改短：3 秒重建 → 再 3 秒切 VLC → 再 5 秒提示换下一条）
-    private func watchdog(_ p: AVPlayer) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+    /// 2 倍速开 / 关：带动画，并通知外层（沉浸 / 恢复）
+    private func setBoost(_ on: Bool) {
+        guard rateBoost != on else { return }
+        withAnimation(.easeInOut(duration: 0.2)) { rateBoost = on }
+        onRateBoost?(on)
+    }
+
+    /// 起播看门狗：当前屏 6 秒还没走（网络抖 / 预加载的 item 失效），重建播放项再来一次；再不行切 VLC。
+    /// 只要缓冲还在往前涨就不拆（b26–b43 是 3 秒一到就重建，网络慢时把下了一半的数据白白丢掉，黑屏反而更久）
+    private func watchdog(_ p: AVPlayer, buffered prev: Double? = nil) {
+        let base = prev ?? bufferedEnd(p)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
             guard isActive, isPlaying, player === p, !seeking, vlc == nil else { return }
-            let stuck = p.currentItem == nil || p.currentItem?.status == .failed || p.currentTime().seconds < 0.1
-            guard stuck else { return }
+            let failed = p.currentItem == nil || p.currentItem?.status == .failed
+            guard failed || p.currentTime().seconds < 0.1 else { return }
+            let now = bufferedEnd(p)
+            if !failed, now > base + 0.5 { watchdog(p, buffered: now); return }   // 还在下，再等一轮
             if avRetried { startVLC() } else { avRetried = true; rebuild() }
         }
+    }
+    private func bufferedEnd(_ p: AVPlayer) -> Double {
+        guard let r = p.currentItem?.loadedTimeRanges.first?.timeRangeValue else { return 0 }
+        let e = CMTimeRangeGetEnd(r).seconds
+        return e.isFinite ? e : 0
     }
 
     private func rebuild() {
@@ -529,6 +550,7 @@ struct PlayerPage: View {
 
     private func teardown() {
         loadFailed = false
+        if rateBoost { rateBoost = false; onRateBoost?(false) }
         if let v = vlc { onSavePosition(v.current); v.onEnd = nil; v.onProgress = nil; v.stop(); vlc = nil }
         if let p = player { onSavePosition(p.currentTime().seconds) }
         if let t = timeToken { player?.removeTimeObserver(t); timeToken = nil }

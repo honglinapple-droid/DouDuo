@@ -97,7 +97,7 @@ extension DouyinBridge {
     }
 
     func followFeed(cursor: String) async throws -> (items: [DYAweme], cursor: String, hasMore: Bool) {
-        try await list(Self.followJS, ["cursor": cursor])
+        try await serialized { try await self.list(Self.followJS, ["cursor": cursor]) }
     }
 
     /// 搜索：网页接口只给第一页（翻第二页安全 SDK 直接压住不返回，换参数 / search_id 都一样）

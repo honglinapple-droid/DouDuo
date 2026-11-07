@@ -26,11 +26,25 @@ final class DYTasteProfile {
         }
     }
 
-    func save() {
+    private var saveTask: Task<Void, Never>?
+    /// 存盘：2 秒内多次改动只存一次，编码在后台（seen 有几千条，之前每划一条都在主线程编码一遍）
+    func save(now: Bool = false) {
         guard dirty else { return }
+        if now { saveTask?.cancel(); saveTask = nil; writeNow(); return }
+        guard saveTask == nil else { return }
+        saveTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard let self, !Task.isCancelled else { return }
+            self.saveTask = nil
+            self.writeNow()
+        }
+    }
+    private func writeNow() {
         dirty = false
         let s = Store(tag: tag, author: author, hashtag: hashtag, seen: seen, positives: positives, seededAt: seededAt)
-        UserDefaults.standard.set(try? JSONEncoder().encode(s), forKey: Self.key)
+        Task.detached(priority: .utility) {
+            UserDefaults.standard.set(try? JSONEncoder().encode(s), forKey: Self.key)
+        }
     }
 
     static func hashtags(_ desc: String) -> [String] {
@@ -63,7 +77,7 @@ final class DYTasteProfile {
         for a in history.prefix(200) { seen[a.id] = seededAt }
         prune()
         dirty = true
-        save()
+        save(now: true)
     }
 
     enum Event { case watched(fraction: Double, seconds: Double), liked, collected, disliked }
@@ -209,8 +223,8 @@ final class DYRecommender {
     /// 后台补备用池：相关推荐（拿最近正向的种子问）+ 关注的人。不重试，拉不到就算；主线不等它
     private var lastRefill: Date = .distantPast
     func refillPool(_ bridge: DouyinBridge, loggedIn: Bool) {
-        // 最多一分钟补一次，一次 2 个请求（相关推荐 1 + 关注 1），别和主线抢
-        guard !refilling, pool.count < 8, Date().timeIntervalSince(lastRefill) > 60 else { return }
+        // 最多三分钟补一次，一次 2 个请求（相关推荐 1 + 关注 1），且都排在串行队列里，不和主线抢
+        guard !refilling, pool.count < 8, Date().timeIntervalSince(lastRefill) > 180 else { return }
         refilling = true; lastRefill = Date()
         Task {
             defer { refilling = false }
@@ -237,7 +251,7 @@ extension DouyinBridge {
     private struct RelatedResp: Decodable { let status: Int; let items: [DYAweme] }
     /// 相关推荐：抖音自己的"和这条相似的"，是能接到的最接近抖音算法的一路
     func related(_ id: String) async throws -> [DYAweme] {
-        let d = try await call(Self.relatedJS, args: ["id": id], attempts: 1)
+        let d = try await serialized { try await self.call(Self.relatedJS, args: ["id": id], attempts: 1) }
         return try JSONDecoder().decode(RelatedResp.self, from: d).items
     }
     static let relatedJS = #"""

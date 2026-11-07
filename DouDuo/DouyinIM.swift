@@ -244,33 +244,39 @@ private enum DYIMJS {
     """#
 
 
-    /// 把一个视频（按 id）以卡片形式分享给朋友：后台网页不刷新地打开视频弹窗 → 分享面板 → 点那个人旁边的「分享」
-    static let shareVideo = helpers + #"""
+    /// 把一个视频以卡片形式分享给朋友。前提：后台网页已经**整页跳到** /jingxuan?modal_id=视频号
+    ///（b38 用"改地址 + 假 popstate"在刚加载的页面上抖音根本不响应，每次都报没打开；真加载 3 秒弹窗就开）。
+    /// 弹窗 → 悬停分享按钮出面板 → 「最近分享」里有这个人就点他旁边的「分享」；没有就点「分享给朋友」进完整列表找
+    static let shareOnPage = helpers + #"""
     const hov = el => { const r = el.getBoundingClientRect(); for (const t of ['pointerover', 'pointerenter', 'mouseover', 'mouseenter', 'mousemove']) el.dispatchEvent(new (t.startsWith('pointer') ? PointerEvent : MouseEvent)(t, { bubbles: true, clientX: r.x + r.width / 2, clientY: r.y + r.height / 2, pointerId: 1 })); };
     const panelBtns = () => [...document.querySelectorAll('*')].filter(x => x.childElementCount <= 1 && txt(x) === '分享' && x.getBoundingClientRect().width > 0 && x.getBoundingClientRect().width < 120 && !x.closest('.imContainer'));
-    const closeAll = async () => { document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true })); await sleep(250); if (/modal_id=/.test(location.href)) history.back(); await sleep(400); };
-    if (!location.href.includes('modal_id=' + id)) {
-      if (/modal_id=/.test(location.href)) { history.back(); await sleep(500); }
-      history.pushState({}, '', '/jingxuan?modal_id=' + id); window.dispatchEvent(new PopStateEvent('popstate', { state: {} }));
-    }
+    const waitChange = async (btn) => { const l0 = txt(btn); fire(btn); for (let k = 0; k < 15; k++) { await sleep(150); const t1 = document.body.contains(btn) ? txt(btn) : ''; if (t1 !== l0) return true; } return false; };
     let share = null;
-    for (let i = 0; i < 30; i++) { await sleep(200); share = document.querySelector('[data-e2e=video-player-share]'); if (share && share.getBoundingClientRect().width > 0) break; }
+    for (let i = 0; i < 50; i++) { share = document.querySelector('[data-e2e=video-player-share]'); if (share && share.getBoundingClientRect().width > 0) break; await sleep(200); }
     document.querySelectorAll('video').forEach(v => { try { v.pause(); } catch (e) {} });
-    if (!share) { await closeAll(); return JSON.stringify({ ok: false, why: 'no-modal' }); }
+    if (!share) return JSON.stringify({ ok: false, why: 'no-modal' });
+    await sleep(800);
     let e = share;
     for (let i = 0; i < 5 && e && !panelBtns().length; i++) { hov(e); await sleep(400); e = e.parentElement; }
     if (!panelBtns().length) { e = share; for (let i = 0; i < 5 && e && !panelBtns().length; i++) { fire(e); await sleep(500); e = e.parentElement; } }
-    if (!panelBtns().length) { await closeAll(); return JSON.stringify({ ok: false, why: 'no-panel' }); }
+    if (!panelBtns().length) return JSON.stringify({ ok: false, why: 'no-panel' });
     const rows = panelBtns().map(b => { let row = b; for (let i = 0; i < 6 && row && !row.querySelector('img'); i++) row = row.parentElement; return { b, row, t: txt(row) }; });
-    const hit = rows.find(x => x.t.split('\n')[0].trim() === name) || rows.find(x => x.t.startsWith(name));
-    if (!hit) { await closeAll(); return JSON.stringify({ ok: false, why: 'no-friend', n: rows.length }); }
-    const label0 = txt(hit.b);
-    fire(hit.b);
-    let changed = false;
-    for (let k = 0; k < 15; k++) { await sleep(150); const t1 = document.body.contains(hit.b) ? txt(hit.b) : ''; if (t1 !== label0) { changed = true; break; } }
-    await sleep(400);
-    await closeAll();
-    return JSON.stringify({ ok: true, changed });
+    const hit = rows.find(x => x.t.split('\n')[0].trim() === name) || rows.find(x => x.t.startsWith(name) && !/^分享给朋友/.test(x.t));
+    if (hit) { const changed = await waitChange(hit.b); await sleep(400); return JSON.stringify({ ok: true, changed, via: 'recent' }); }
+    // 不在「最近分享」里：点「分享给朋友」，打开完整的选择朋友弹窗
+    const more = rows.find(x => /^分享给朋友/.test(x.t));
+    if (!more) return JSON.stringify({ ok: false, why: 'no-friend', n: rows.length });
+    fire(more.b);
+    let modal = null;
+    for (let i = 0; i < 20; i++) { await sleep(150); modal = [...document.querySelectorAll('.semi-modal-content')].find(m => /选择朋友/.test(m.innerText || '')); if (modal) break; }
+    if (!modal) return JSON.stringify({ ok: false, why: 'no-picker' });
+    const prow = [...modal.querySelectorAll('.ShareMessageFriendPickerModalconversationItem')];
+    const row = prow.find(r => txt(r).startsWith(name + ' ') || txt(r) === name) || prow.find(r => txt(r).startsWith(name));
+    const closePicker = () => { const c = modal.querySelector('.ShareMessageFriendPickerModalheaderClose') || modal.querySelector('[class*=headerClose]'); if (c) fire(c); };
+    if (!row) { closePicker(); return JSON.stringify({ ok: false, why: 'no-friend', n: prow.length }); }
+    const changed = await waitChange(row.querySelector('.ShareMessageFriendPickerModalsendButton'));
+    await sleep(400); closePicker();
+    return JSON.stringify({ ok: true, changed, via: 'picker' });
     """#
 
     /// 取消回复
@@ -330,13 +336,24 @@ final class DYIMWeb: NSObject, WKNavigationDelegate {
         web.load(URLRequest(url: URL(string: "https://www.douyin.com/jingxuan")!))
     }
 
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in
-            guard let self else { return }
-            ready = true
-            waiters.forEach { $0.resume() }; waiters.removeAll()
-        }
+    /// 整页跳到某个地址并等它加载完（最多 20 秒；加载失败也放行，让后面的脚本自己报错）
+    func navigate(_ url: URL) async {
+        ready = false
+        web.load(URLRequest(url: url))
+        for _ in 0..<80 where !ready { try? await Task.sleep(nanoseconds: 250_000_000) }
+        markReady()
     }
+
+    private func markReady() {
+        ready = true
+        waiters.forEach { $0.resume() }; waiters.removeAll()
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) { [weak self] in self?.markReady() }
+    }
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { markReady() }
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { markReady() }
 
     func webView(_ webView: WKWebView, decidePolicyFor action: WKNavigationAction,
                  decisionHandler: @escaping @MainActor (WKNavigationActionPolicy) -> Void) {
@@ -410,6 +427,8 @@ final class DYIMModel: ObservableObject {
     let web = DYIMWeb()
     private var bridge: DouyinBridge?
     private var panelReady = false
+    /// 正在分享视频（后台网页跳到了视频页）：列表 / 聊天轮询先停，别去点消息入口把弹窗弄没
+    private var sharing = false
     private var listTask: Task<Void, Never>?
     private var chatTask: Task<Void, Never>?
     private var bannerTask: Task<Void, Never>?
@@ -442,7 +461,7 @@ final class DYIMModel: ObservableObject {
     }
 
     func refreshList() async {
-        guard await ensurePanel() else { return }
+        guard !sharing, await ensurePanel() else { return }
         do {
             let r = try await web.eval(DYIMJS.list, as: ListResp.self)
             loggedIn = r.login
@@ -514,6 +533,7 @@ final class DYIMModel: ObservableObject {
     func closeChat() { chatTask?.cancel(); openName = nil; chatVisible = false }
 
     func refreshMessages() async {
+        guard !sharing else { return }
         do {
             let r = try await web.eval(DYIMJS.messages, as: MsgResp.self)
             guard let name = openName, r.title.isEmpty || r.title == name else { return }
@@ -627,20 +647,39 @@ final class DYIMModel: ObservableObject {
         } catch { return nil }
     }
 
-    /// 视频页「分享」：把视频以卡片形式发给朋友（走网页视频弹窗的分享面板）
+    /// 视频页「分享」：把视频以卡片形式发给朋友。后台网页整页跳到视频弹窗地址（只改地址抖音不认），
+    /// 面板里点人；发完跳回精选页，把消息面板和开着的聊天接回来
     func shareVideo(_ id: String, to c: DYIMConversation) async -> Bool {
         lastSendError = nil
         guard loggedIn else { lastSendError = "抖音未登录"; return false }
-        guard let r = try? await web.eval(DYIMJS.shareVideo, ["id": id, "name": c.name], as: ActionResp.self) else { lastSendError = "网页没响应，等几秒再试"; return false }
+        guard !sharing else { lastSendError = "上一条还在发，稍等"; return false }
+        sharing = true
+        await web.navigate(URL(string: "https://www.douyin.com/jingxuan?modal_id=\(id)")!)
+        panelReady = false
+        let r = try? await web.eval(DYIMJS.shareOnPage, ["name": c.name], as: ActionResp.self)
+        Task { await restoreAfterShare() }
+        guard let r else { lastSendError = "网页没响应，等几秒再试"; return false }
         if !r.ok {
             switch r.why ?? "" {
-            case "no-friend": lastSendError = "\(c.name) 不在网页的最近分享列表里，先在消息里给他发一条再分享"
+            case "no-friend": lastSendError = "网页的朋友列表里没找到 \(c.name)"
             case "no-panel": lastSendError = "网页分享面板没打开，再试一次"
             case "no-modal": lastSendError = "网页没打开这个视频，再试一次"
+            case "no-picker": lastSendError = "网页的选择朋友弹窗没打开，再试一次"
             default: lastSendError = "没发出去"
             }
         }
         return r.ok
+    }
+
+    /// 分享完：后台网页回精选页，重开消息面板；聊天开着就把那个人重新点开
+    private func restoreAfterShare() async {
+        await web.navigate(URL(string: "https://www.douyin.com/jingxuan")!)
+        panelReady = false
+        sharing = false
+        guard await ensurePanel() else { return }
+        if let n = openName, let c = conversations.first(where: { $0.name == n }) {
+            _ = try? await web.eval(DYIMJS.open, ["name": c.name, "index": c.index], as: OKResp.self)
+        }
     }
 
     /// 把这条消息（视频）转发给朋友：走网页自己的「分享 → 选择朋友 → 发送」

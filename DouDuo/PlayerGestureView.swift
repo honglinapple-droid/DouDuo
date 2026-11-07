@@ -41,6 +41,7 @@ struct PlayerGestureView: UIViewRepresentable {
         long.minimumPressDuration = 0.5
         long.allowableMovement = 12     // 手指移动超 12pt（横滑/竖滑）→ 长按取消，让位给 pan/分页
         long.delegate = c
+        c.long = long
 
         let pan = UIPanGestureRecognizer(target: c, action: #selector(Coordinator.handlePan(_:)))
         pan.delegate = c
@@ -65,11 +66,29 @@ struct PlayerGestureView: UIViewRepresentable {
         context.coordinator.parent = self   // 刷新闭包，回调读到最新 @State
     }
 
+    static func dismantleUIView(_ uiView: UIView, coordinator: Coordinator) { coordinator.unlockScroll() }
+
     final class Coordinator: NSObject, UIGestureRecognizerDelegate {
         var parent: PlayerGestureView
         weak var view: UIView?
         weak var pan: UIPanGestureRecognizer?
         weak var edge: UIScreenEdgePanGestureRecognizer?
+        weak var long: UILongPressGestureRecognizer?
+        /// 长按 2 倍速期间被封住的外层列表（翻页手势停用，松手恢复）
+        private weak var lockedScroll: UIScrollView?
+
+        /// 长按 2 倍速进行中
+        var longActive: Bool { long.map { $0.state == .began || $0.state == .changed } ?? false }
+
+        /// 防误触：长按认定后，手指漂移不该变成"拖进度"或"切视频"——把外层 ScrollView 的翻页手势暂时停掉
+        private func lockScroll() {
+            var s = view?.superview
+            while let x = s {
+                if let sv = x as? UIScrollView { lockedScroll = sv; sv.panGestureRecognizer.isEnabled = false; return }
+                s = x.superview
+            }
+        }
+        func unlockScroll() { lockedScroll?.panGestureRecognizer.isEnabled = true; lockedScroll = nil }
         init(_ p: PlayerGestureView) { parent = p }
 
         @objc func handleSingle(_ g: UITapGestureRecognizer) { parent.onSingleTap() }
@@ -81,8 +100,14 @@ struct PlayerGestureView: UIViewRepresentable {
 
         @objc func handleLong(_ g: UILongPressGestureRecognizer) {
             switch g.state {
-            case .began: parent.onLongPress(true)
-            case .ended, .cancelled, .failed: parent.onLongPress(false)
+            case .began:
+                // 进入 2 倍速：震一下（抖音同款触感），并封住翻页——长按期间手指漂移不切视频
+                UIImpactFeedbackGenerator(style: .medium).impactOccurred()
+                lockScroll()
+                parent.onLongPress(true)
+            case .ended, .cancelled, .failed:
+                unlockScroll()
+                parent.onLongPress(false)
             default: break
             }
         }
@@ -116,6 +141,8 @@ struct PlayerGestureView: UIViewRepresentable {
 
         func gestureRecognizerShouldBegin(_ g: UIGestureRecognizer) -> Bool {
             if g is UIScreenEdgePanGestureRecognizer { return true }   // 边缘退出始终允许
+            // 长按 2 倍速进行中：横向拖进度不许起手（手指漂移不该变成拖进度）
+            if g is UIPanGestureRecognizer, longActive { return false }
             guard let pg = g as? UIPanGestureRecognizer, let v = view else { return true }
             let vel = pg.velocity(in: v)
             // 底部 ~64pt 留给底部进度条手势，避免与全屏横滑重复触发
@@ -136,6 +163,7 @@ struct PlayerGestureView: UIViewRepresentable {
         // 手势互斥：Pan 已激活（横向快进）→ 独占，不允许 ScrollView 同时响应
         // Pan 被拒绝（竖向）→ 返回 true 让 ScrollView 接管分页
         func gestureRecognizer(_ g: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+            if longActive { return false }   // 2 倍速期间独占，别的手势都别进来
             if let pg = pan, pg.state == .began || pg.state == .changed {
                 return false   // 正在拖进度，独占
             }
