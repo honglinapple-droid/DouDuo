@@ -244,6 +244,13 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
         return Self.interpret(r)
     }
 
+    private struct DetailResp: Decodable { let status: Int; let item: DYAweme? }
+    /// 按视频 id 取详情（聊天里的视频卡片用）
+    func detail(_ id: String) async throws -> DYAweme? {
+        let d = try await call(Self.detailJS, args: ["id": id], attempts: 2)
+        return try JSONDecoder().decode(DetailResp.self, from: d).item
+    }
+
     /// 关注 / 取关作者：网页版同一个接口（commit/follow/user）
     func follow(_ secUid: String, follow: Bool) async throws -> DYActionResult {
         let d = try await call(Self.followUserJS, args: ["sec": secUid, "type": follow ? "1" : "0"], attempts: 2)
@@ -425,6 +432,12 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
       new URLSearchParams({ aweme_id: id }).toString());
     const d = parse(r.t) || {};
     return JSON.stringify({ status: r.s, statusCode: d.status_code, msg: d.status_msg || (r.s === 200 ? '' : (r.t || '').slice(0, 120)) });
+    """#
+
+    private static let detailJS = #"""
+    const r = await req('GET', '/aweme/v1/web/aweme/detail/?' + q({ aweme_id: id }));
+    const d = parse(r.t) || {};
+    return JSON.stringify({ status: r.s, item: d.aweme_detail ? mapA(d.aweme_detail) : null });
     """#
 
     private static let followUserJS = #"""
@@ -724,7 +737,7 @@ final class DYFeedModel: ObservableObject {
         var added = 0
         let want = wantOverride ?? (portraitOnly ? 6 : 1)
         // 分轮拉：第一轮 1 个请求（快），不够再并行 3 个，最多 3 轮。原来是最多 8 个一个接一个
-        let rounds: [Int] = portraitOnly ? [1, 3, 3] : [1]
+        let rounds: [Int] = portraitOnly ? [1, 2, 2, 2] : [1]
         do {
             for n in rounds {
                 let pages: [(items: [DYAweme], hasMore: Bool)] = try await withThrowingTaskGroup(of: (items: [DYAweme], hasMore: Bool).self) { g in
@@ -843,6 +856,7 @@ struct DouyinFeedScreen: View {
             }
         }
         .background(DouyinBridgeHost(bridge: bridge).frame(width: 1, height: 1).allowsHitTesting(false))
+        .background(DYIMWebHost(im: im).frame(width: 1, height: 1).allowsHitTesting(false))
         .statusBarHidden(true)
         .defersSystemGestures(on: deferBottomGesture ? .bottom : [])
         .task {
@@ -851,7 +865,8 @@ struct DouyinFeedScreen: View {
             try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
             try? AVAudioSession.sharedInstance().setActive(true)
             im.attach(bridge)
-            Task { try? await Task.sleep(nanoseconds: 8_000_000_000); im.warmUp() }
+            // 消息用自己的后台网页，不占签名页；晚 2 秒起，先让第一条视频起来
+            Task { try? await Task.sleep(nanoseconds: 2_000_000_000); im.start() }
             #if DEBUG
             if ProcessInfo.processInfo.environment["DOUDUO_SELFTEST"] == "1" { Task { await DDSelfTest.run(bridge) } }
             if ProcessInfo.processInfo.environment["DOUDUO_APITEST"] == "1" { Task { await DDApiProbe.run(bridge) } }
@@ -1117,7 +1132,9 @@ struct DouyinFeedScreen: View {
             DYSearchScreen(bridge: bridge, onAuthor: { a in authorTarget = a.author })
         }
         .fullScreenCover(isPresented: $showMessages) {
-            DYMessagesScreen(im: im, onLogin: { showMessages = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { web = DYWebTarget(url: DouyinWeb.home) } })
+            DYMessagesScreen(im: im, bridge: bridge, onClose: { showMessages = false },
+                             onLogin: { showMessages = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { web = DYWebTarget(url: DouyinWeb.home) } },
+                             onAuthor: { authorTarget = $0.author })
         }
         .overlay(alignment: .top) {
             if let b = im.banner, !showMessages {
