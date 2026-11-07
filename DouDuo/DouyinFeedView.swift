@@ -675,6 +675,8 @@ struct DouyinFeedScreen: View {
     @StateObject private var bridge = DouyinBridge()
     @StateObject private var feed = DYFeedModel()
     @State private var insets = EdgeInsets()
+    @State private var showScreenInfo = false
+    @State private var screenInfo = ""
     @State private var preloader = DYPreloader()
     @State private var resume: [String: Double] = [:]
     @State private var currentID: String?
@@ -1227,6 +1229,8 @@ struct DouyinFeedScreen: View {
             if let cur = current {
                 ShareLink(item: cur.webURL) { Label("分享链接", systemImage: "square.and.arrow.up") }
             }
+            // 折叠屏适配用：把当前屏幕的逻辑尺寸、缩放、安全区、方向读出来，内屏/外屏 × 横/竖各截一次图
+            Button("屏幕信息", systemImage: "ruler") { screenInfo = Self.screenInfoText(insets: insets); showScreenInfo = true }
         } label: {
             Image(systemName: "line.3.horizontal")
                 .font(.system(size: theme.typography.pointSize(.headline), weight: .semibold))
@@ -1236,6 +1240,35 @@ struct DouyinFeedScreen: View {
                 .themeShadow(.mediaLabel)
         }
         .accessibilityLabel("抖音菜单")
+        .alert("屏幕信息", isPresented: $showScreenInfo) {
+            Button("复制") { UIPasteboard.general.string = screenInfo }
+            Button("好", role: .cancel) {}
+        } message: { Text(screenInfo) }
+    }
+
+    static func screenInfoText(insets: EdgeInsets) -> String {
+        let v = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        let b = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+        let scene = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }.first
+        let screen = scene?.screen
+        let bounds = screen?.bounds ?? .zero
+        let native = screen?.nativeBounds ?? .zero
+        let scale = screen?.scale ?? 0
+        let orient: String = switch scene?.interfaceOrientation {
+            case .portrait: "竖屏"; case .portraitUpsideDown: "竖屏(倒)"
+            case .landscapeLeft: "横屏(左)"; case .landscapeRight: "横屏(右)"; default: "未知" }
+        let idiom = UIDevice.current.userInterfaceIdiom == .pad ? "pad" : "phone"
+        let f = { (x: CGFloat) in String(format: "%.0f", x) }
+        let win = scene?.windows.first
+        let safe = win?.safeAreaInsets ?? .zero
+        return """
+        DouDuo \(v) (\(b))  \(UIDevice.current.systemVersion)  \(idiom)
+        方向: \(orient)
+        逻辑尺寸: \(f(bounds.width)) × \(f(bounds.height)) pt
+        像素: \(f(native.width)) × \(f(native.height)) px  缩放 \(f(scale))x
+        系统安全区 上\(f(safe.top)) 下\(f(safe.bottom)) 左\(f(safe.left)) 右\(f(safe.right))
+        页面安全区 上\(f(insets.top)) 下\(f(insets.bottom)) 左\(f(insets.leading)) 右\(f(insets.trailing))
+        """
     }
 }
 
