@@ -9,49 +9,49 @@ permissions:
 jobs:
   probe:
     runs-on: xcode-27
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
-      - name: Xcode and simulator inventory
-        run: |
-          xcodebuild -version
-          echo "=== runtimes ==="; xcrun simctl list runtimes
-          echo "=== iPhone device types ==="; xcrun simctl list devicetypes | grep -i iphone
-          echo "=== simctl subcommands ==="; xcrun simctl help 2>&1 | head -80
-      - name: Dump device profiles (screen size, scale, folding)
+      - name: Inventory
         run: |
           mkdir -p out
-          DT="$(xcode-select -p)/Platforms/iPhoneOS.platform/Library/Developer/CoreSimulator/Profiles/DeviceTypes"
-          ls "$DT" | tee out/devicetypes.txt
-          for d in "$DT"/*.simdevicetype; do
-            n=$(basename "$d" .simdevicetype)
-            case "$n" in *Duo*|*Fold*|*iPhone\ 17*|*iPhone\ 18*)
-              echo "=============== $n"
-              for f in profile.plist capabilities.plist; do
-                [ -f "$d/Contents/Resources/$f" ] && { echo "--- $f"; plutil -p "$d/Contents/Resources/$f"; }
-              done
-              cp -R "$d/Contents/Resources" "out/$n" 2>/dev/null || true
-              ;;
-            esac
-          done | tee out/profiles.txt
-      - name: Boot a Duo simulator and take screenshots
+          xcodebuild -version | tee out/xcode.txt
+          xcrun simctl list runtimes | tee out/runtimes.txt
+          xcrun simctl list devices available | tee out/devices.txt
+      - name: Dump iPhone Duo device profile
         run: |
-          set +e
-          NAME=$(xcrun simctl list devicetypes | grep -iE "duo|fold" | head -1 | sed -E 's/ \(com\.apple.*//')
-          echo "device: $NAME"
-          [ -z "$NAME" ] && { echo "no foldable device type found"; exit 0; }
-          RT=$(xcrun simctl list runtimes | grep -i "iOS" | tail -1 | grep -oE "com\.apple\.CoreSimulator\.SimRuntime\.iOS[-0-9]+")
-          UDID=$(xcrun simctl create probe "$NAME" "$RT")
-          xcrun simctl boot "$UDID"; xcrun simctl bootstatus "$UDID" -b
-          sleep 10
-          xcrun simctl io "$UDID" screenshot out/duo-portrait.png
-          xcrun simctl ui "$UDID" --help 2>&1 | head -60
-          xcrun simctl ui "$UDID" posture 2>&1 | head -5
-          for a in "posture folded" "posture unfolded" "fold" "unfold"; do echo ">> $a"; xcrun simctl ui "$UDID" $a 2>&1 | head -3; done
-          xcrun simctl io "$UDID" screenshot out/duo-after-toggle.png 2>/dev/null
-          echo "=== device plist ==="; plutil -p "$HOME/Library/Developer/CoreSimulator/Devices/$UDID/device.plist" 2>/dev/null | head -30
-          sips -g pixelWidth -g pixelHeight out/*.png
-          xcrun simctl shutdown "$UDID"
+          DT="$(xcode-select -p)/Platforms/iPhoneOS.platform/Library/Developer/CoreSimulator/Profiles/DeviceTypes"
+          ls "$DT" > out/devicetypes.txt
+          D="$DT/iPhone Duo.simdevicetype"
+          ls -R "$D" | head -50
+          for f in profile.plist capabilities.plist; do
+            echo "--- $f"; plutil -p "$D/Contents/Resources/$f" | tee -a out/duo-profile.txt
+          done
+          cp -R "$D/Contents/Resources" out/duo-resources || true
+          # 同时抓一台直板机做对照
+          plutil -p "$DT/iPhone 17.simdevicetype/Contents/Resources/profile.plist" > out/iphone17-profile.txt || true
+      - name: Boot iPhone Duo and screenshot both postures
+        continue-on-error: true
+        run: |
+          UDID=$(xcrun simctl list devices available -j | python3 -c '
+          import json,sys
+          d=json.load(sys.stdin)["devices"]
+          for rt,devs in d.items():
+              for x in devs:
+                  if x["name"]=="iPhone Duo": print(x["udid"]); sys.exit()
+          ')
+          echo "udid=$UDID"
+          xcrun simctl boot "$UDID"; xcrun simctl bootstatus "$UDID" -b; sleep 15
+          xcrun simctl io "$UDID" screenshot out/duo-default.png
+          echo "=== simctl ui help ==="; xcrun simctl ui "$UDID" 2>&1 | head -60 | tee out/simctl-ui-help.txt
+          echo "=== simctl help ==="; xcrun simctl help 2>&1 | grep -iE "fold|posture|orient|rotate|display" | tee -a out/simctl-ui-help.txt
+          for a in "posture" "posture folded" "posture unfolded" "fold" "unfold" "display" ; do
+            echo ">> $a"; xcrun simctl ui "$UDID" $a 2>&1 | head -5 | tee -a out/simctl-ui-help.txt
+            xcrun simctl io "$UDID" screenshot "out/duo-$(echo $a | tr ' ' '-').png" 2>/dev/null || true
+          done
+          sips -g pixelWidth -g pixelHeight out/*.png | tee out/png-sizes.txt
+          xcrun simctl shutdown "$UDID" || true
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: simulator-probe
           path: out
