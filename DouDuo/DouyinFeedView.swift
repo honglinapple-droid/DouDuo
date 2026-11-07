@@ -808,6 +808,8 @@ struct DouyinFeedScreen: View {
     @AppStorage(DYVideoCache.countKey) private var cacheCount = DYVideoCache.defaultCount
     @AppStorage("douyin_danmaku_v2") private var danmakuOn = false
     @State private var showMine = false
+    @State private var showMessages = false
+    @StateObject private var im = DYIMModel()
     @State private var authorTarget: DYAweme.Author?
 
     private var currentIndex: Int? { currentID.flatMap { id in feed.items.firstIndex { $0.id == id } } }
@@ -848,6 +850,8 @@ struct DouyinFeedScreen: View {
             initialized = true
             try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
             try? AVAudioSession.sharedInstance().setActive(true)
+            im.attach(bridge)
+            Task { try? await Task.sleep(nanoseconds: 8_000_000_000); im.warmUp() }
             #if DEBUG
             if ProcessInfo.processInfo.environment["DOUDUO_SELFTEST"] == "1" { Task { await DDSelfTest.run(bridge) } }
             if ProcessInfo.processInfo.environment["DOUDUO_APITEST"] == "1" { Task { await DDApiProbe.run(bridge) } }
@@ -972,12 +976,7 @@ struct DouyinFeedScreen: View {
     }
 
     private func selectTab(_ target: DYTab) {
-        if target == .messages {
-            // 消息：先打开网页版的私信页（原生界面是下一步）
-            DouyinWeb.pendingAutoIM = true
-            web = DYWebTarget(url: DouyinWeb.home)
-            return
-        }
+        if target == .messages { showMessages = true; return }
         if tab == .recommend && target == .recommend {
             Task { await refreshRecommendations() }
         } else {
@@ -1117,6 +1116,17 @@ struct DouyinFeedScreen: View {
         .fullScreenCover(isPresented: $showSearch) {
             DYSearchScreen(bridge: bridge, onAuthor: { a in authorTarget = a.author })
         }
+        .fullScreenCover(isPresented: $showMessages) {
+            DYMessagesScreen(im: im, onLogin: { showMessages = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { web = DYWebTarget(url: DouyinWeb.home) } })
+        }
+        .overlay(alignment: .top) {
+            if let b = im.banner, !showMessages {
+                DYIMBannerView(banner: b, onTap: { im.pendingOpen = b.name; im.banner = nil; showMessages = true }, onClose: { im.banner = nil })
+                    .padding(.top, max(insets.top, 8) + 44)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+            }
+        }
+        .animation(.snappy, value: im.banner)
         .fullScreenCover(isPresented: $showMine) {
             DYMineScreen(bridge: bridge,
                          onLogin: { showMine = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { web = DYWebTarget(url: DouyinWeb.home) } },
@@ -1205,7 +1215,7 @@ struct DouyinFeedScreen: View {
                     LazyVStack(spacing: 0) {
                         ForEach(feed.items) { item in
                             DYVideoPage(item: item,
-                                        isCurrent: item.id == currentID && web == nil && tab == .recommend && !showSearch && !showMine,
+                                        isCurrent: item.id == currentID && web == nil && tab == .recommend && !showSearch && !showMine && !showMessages,
                                         insets: insets,
                                         resume: resume[item.id],
                                         liked: feed.liked.contains(item.id),
