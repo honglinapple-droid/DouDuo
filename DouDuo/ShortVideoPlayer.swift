@@ -225,7 +225,7 @@ struct PlayerPage: View {
             if !active, rateBoost { setBoost(false) }   // 滑走时还按着：2 倍速状态清掉，外层恢复
             if !active, seeking { cancelSeek() }        // 滑走时还在拖：拖动状态清掉
             if let v = vlc {
-                if active { v.mediaPlayer.audio?.isMuted = false; v.mediaPlayer.play(); isPlaying = true }
+                if active { v.mediaPlayer.audio?.isMuted = DYMute.on; v.mediaPlayer.play(); isPlaying = true }
                 else { v.mediaPlayer.pause(); isPlaying = false; onSavePosition(v.current) }
                 return
             }
@@ -234,7 +234,7 @@ struct PlayerPage: View {
             if active {
                 try? AVAudioSession.sharedInstance().setCategory(.playback)
                 try? AVAudioSession.sharedInstance().setActive(true)
-                p.isMuted = false; p.play(); isPlaying = true
+                p.isMuted = DYMute.on; p.play(); isPlaying = true
                 watchdog(p)
             } else {
                 p.isMuted = true; p.pause(); isPlaying = false
@@ -380,7 +380,7 @@ struct PlayerPage: View {
         // 停放回来的播放器已经停在原进度上，不用再 seek（seek 会卡一下）
         if let r = resumePosition, r > 1, abs(p.currentTime().seconds - r) > 1 { p.seek(to: CMTime(seconds: r, preferredTimescale: 600)) }
         if pre != nil, p.currentTime().seconds > 0.5 { current = p.currentTime().seconds }
-        p.isMuted = !isActive
+        p.isMuted = !isActive || DYMute.on
         if isActive {
             try? AVAudioSession.sharedInstance().setCategory(.playback)
             try? AVAudioSession.sharedInstance().setActive(true)
@@ -440,7 +440,7 @@ struct PlayerPage: View {
         p.automaticallyWaitsToMinimizeStalling = true
         player = p
         attachObservers(p)
-        p.isMuted = false
+        p.isMuted = DYMute.on
         p.play()
         isPlaying = true
         watchdog(p)
@@ -480,7 +480,7 @@ struct PlayerPage: View {
         if let v = vlc {
             try? AVAudioSession.sharedInstance().setCategory(.playback, mode: .moviePlayback)
             try? AVAudioSession.sharedInstance().setActive(true)
-            v.mediaPlayer.audio?.isMuted = false
+            v.mediaPlayer.audio?.isMuted = DYMute.on
             v.mediaPlayer.play(); isPlaying = true
             return
         }

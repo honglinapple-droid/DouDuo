@@ -34,28 +34,59 @@ enum DYHinge: Equatable {
     var isHalfOpen: Bool { self == .partiallyOpen }
 }
 
-/// 监听铰链：iOS 27.1 起用苹果的 `onHingeChange`，低版本不挂
+/// 监听铰链：iOS 27.1 起用苹果的 `onHingeChange`，低版本不挂。
+/// b49：苹果的说法是「铰链实时数据只适合做特效，换布局要等姿态定下来」。慢慢展开时铰链会依次报
+/// 合上 → 半折 → 全开，每报一次就换一次布局会来回跳 → 加「停稳判定」：同一个姿态保持 0.4 秒才算数，
+/// 途中路过的姿态一律不理；定下来以后把「新姿态 + 评论区开关」放进同一个动画一次做完。
 struct DYHingeObserver: ViewModifier {
     @Binding var hinge: DYHinge
+    var onSettle: ((DYHinge, DYHinge) -> Void)?
+    @State private var pending: DYHinge?
+    @State private var settleTask: Task<Void, Never>?
+
     func body(content: Content) -> some View {
         if #available(iOS 27.1, *) {
             content.onHingeChange { _, ctx in
-                guard let h = ctx.hinge else { hinge = .none; return }
-                switch h.status {
-                case .partiallyOpen: hinge = .partiallyOpen
-                case .fullyOpen: hinge = .fullyOpen
-                case .closed: hinge = .closed
-                default: hinge = .none
-                }
+                let h: DYHinge
+                if let x = ctx.hinge {
+                    switch x.status {
+                    case .partiallyOpen: h = .partiallyOpen
+                    case .fullyOpen: h = .fullyOpen
+                    case .closed: h = .closed
+                    default: h = .none
+                    }
+                } else { h = .none }
+                propose(h)
             }
         } else {
             content
         }
     }
+
+    private func propose(_ h: DYHinge) {
+        // 第一次拿到状态（启动时）直接用，不做动画
+        if hinge == .none && pending == nil { hinge = h; return }
+        pending = h
+        settleTask?.cancel()
+        settleTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 400_000_000)
+            guard !Task.isCancelled, let p = pending, p == h else { return }
+            pending = nil
+            let old = hinge
+            guard old != p else { return }
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.9)) {
+                hinge = p
+                onSettle?(old, p)
+            }
+        }
+    }
 }
 
 extension View {
-    func dyHinge(_ hinge: Binding<DYHinge>) -> some View { modifier(DYHingeObserver(hinge: hinge)) }
+    /// onSettle：姿态停稳后调用（已在动画里），用来同时开 / 关评论区
+    func dyHinge(_ hinge: Binding<DYHinge>, onSettle: ((DYHinge, DYHinge) -> Void)? = nil) -> some View {
+        modifier(DYHingeObserver(hinge: hinge, onSettle: onSettle))
+    }
 }
 
 extension GeometryProxy {
@@ -67,11 +98,27 @@ extension GeometryProxy {
         return nil
     }
 
-    /// 半折叠时评论面板该多宽：铺满折痕右边；不在半折叠 / 没有折痕就按原来的 36% 算
+    /// 半折叠时评论面板该多宽：铺满折痕右边；不在半折叠就按原来的 36% 算。
+    /// b49：铰链状态有时比折痕位置先到 → 折痕还没报上来时先按屏幕正中间算，评论区一次就出到最终宽度，不再先窄后宽。
     func dyPanelWidth(hinge: DYHinge, commentsOpen: Bool) -> CGFloat {
-        if hinge.isHalfOpen, commentsOpen, let f = dyFoldFrame(), f.maxX > size.width * 0.3, f.maxX < size.width * 0.7 {
-            return size.width - f.maxX
+        if hinge.isHalfOpen, commentsOpen {
+            if let f = dyFoldFrame() {
+                if f.maxX > size.width * 0.3, f.maxX < size.width * 0.7 { return size.width - f.maxX }
+            } else if size.width > size.height {
+                return (size.width / 2).rounded()
+            }
         }
         return min(380, size.width * 0.36)
     }
+}
+
+/// 调试：DOUDUO_MUTE=1 启动时全程静音（模拟器自测用，别吵到人）
+enum DYMute {
+    static let on: Bool = {
+        #if DEBUG
+        return ProcessInfo.processInfo.environment["DOUDUO_MUTE"] == "1"
+        #else
+        return false
+        #endif
+    }()
 }

@@ -85,6 +85,11 @@ extension DouyinBridge {
         return u
     }
 
+    /// b49：作者作品列表（原生主页九宫格用）。和网页版点进作者主页时发的是同一个请求
+    func userPosts(_ sec: String, cursor: String) async throws -> (items: [DYAweme], cursor: String, hasMore: Bool) {
+        try await serialized { try await self.list(Self.postJS, ["sec": sec, "cursor": cursor]) }
+    }
+
     func myList(_ kind: DYListKind, cursor: String) async throws -> (items: [DYAweme], cursor: String, hasMore: Bool) {
         switch kind {
         case .like:
@@ -225,6 +230,13 @@ extension DouyinBridge {
 
     static let likeJS = listTail + #"""
     const r = await req('GET', '/aweme/v1/web/aweme/favorite/?' + q({ sec_user_id: sec, max_cursor: cursor, min_cursor: '0', count: '18', cut_version: '1' }));
+    const d = parse(r.t) || {};
+    return pack(r, d, d.aweme_list, d.max_cursor, d.has_more);
+    """#
+
+    static let postJS = listTail + #"""
+    const r = await req('GET', '/aweme/v1/web/aweme/post/?' + q({ sec_user_id: sec, max_cursor: cursor, locate_query: 'false', show_live_replay_strategy: '1',
+      need_time_list: cursor === '0' ? '1' : '0', time_list_query: '0', whale_cut_token: '', cut_version: '1', count: '18', publish_video_strategy_type: '2' }));
     const d = parse(r.t) || {};
     return pack(r, d, d.aweme_list, d.max_cursor, d.has_more);
     """#
@@ -538,6 +550,8 @@ struct DYListPlayer: View {
     @State private var liked: Set<String> = []
     @State private var collected: Set<String> = []
     @State private var showComments = false
+    @State private var wideNow = false
+    @State private var author: DYAweme.Author?
     @State private var toast: String?
     @State private var loadingMore = false
 
@@ -564,12 +578,12 @@ struct DYListPlayer: View {
                 ScrollView(.vertical) {
                     LazyVStack(spacing: 0) {
                         ForEach(items) { item in
-                            DYVideoPage(item: item, isCurrent: item.id == currentID, insets: geo.safeAreaInsets,
+                            DYVideoPage(item: item, isCurrent: item.id == currentID && author == nil, insets: geo.safeAreaInsets,
                                         resume: resume[item.id], liked: liked.contains(item.id), collected: collected.contains(item.id),
                                         onLike: { toggleLike(item.id, force: nil) }, onCollect: { toggleCollect(item.id) },
                                         onDoubleTap: { toggleLike(item.id, force: true) },
                                         onComments: { showComments = true },
-                                        onAuthor: { onAuthor(item) },
+                                        onAuthor: { author = item.author },
                                         onSavePosition: { resume[item.id] = $0 }, preloader: preloader,
                                         bridge: bridge, onToast: { show($0) })
                                 .containerRelativeFrame([.horizontal, .vertical])
@@ -601,20 +615,23 @@ struct DYListPlayer: View {
                         .allowsHitTesting(false)
                 }
             }
-            .sheet(isPresented: Binding(get: { showComments && !wide }, set: { showComments = $0 })) {
+            .sheet(isPresented: Binding(get: { showComments && !wide }, set: { v in
+                if v { showComments = true } else { DispatchQueue.main.async { if !wideNow { showComments = false } } }
+            })) {
                 if let cur = current {
-                    DYCommentPanel(bridge: bridge, aweme: cur, onClose: { showComments = false })
+                    DYCommentPanel(bridge: bridge, aweme: cur, onClose: { showComments = false }, horizontalDismiss: false)
                         .presentationDetents([.fraction(0.62), .large])
                 }
             }
             if wide && showComments, let cur = current {
-                DYCommentPanel(bridge: bridge, aweme: cur, onClose: { withAnimation(.snappy) { showComments = false } })
-                    .frame(width: min(380, geo.size.width * 0.36))
+                DYSideComments(bridge: bridge, aweme: cur, width: min(380, geo.size.width * 0.36), open: $showComments)
                     .id(cur.id)
                     .transition(.move(edge: .trailing))
             }
             }
+            .onChange(of: wide, initial: true) { _, w in wideNow = w }
         }
+        .dyAuthorOverlay($author, bridge: bridge)
         .statusBarHidden(true)
         .edgeSwipeBack { dismiss() }
         .onChange(of: currentID) { old, new in
@@ -1021,59 +1038,123 @@ struct DYUserHeader: View {
     }
 }
 
-// MARK: - 作者主页（原生资料卡；作品列表网页接口签名受限 → 按钮跳网页版看全部作品）
+// MARK: - 作者主页
+// b49：原来是半屏资料卡 + 「查看全部作品」跳网页版。改成和手机抖音一样：从右边滑进来的全屏主页，
+// 上面头像 / 简介 / 数据，下面作品九宫格（往下滑自动加载更多），点格子上下刷这个作者的视频；
+// 右滑跟手返回（方向锁定，上下刷九宫格不会误退）。
 
 struct DYAuthorScreen: View {
     let bridge: DouyinBridge
     let author: DYAweme.Author
-    let onWeb: (URL) -> Void
-    @Environment(\.dismiss) private var dismiss
+    let onClose: () -> Void
     @State private var user: DYUser?
     @State private var err: String?
+    @StateObject private var posts: DYPagedModel
+    @State private var open: DYListTarget?
+    @State private var dragX: CGFloat = 0
+    @State private var axis = 0
+
+    init(bridge: DouyinBridge, author: DYAweme.Author, onClose: @escaping () -> Void) {
+        self.bridge = bridge; self.author = author; self.onClose = onClose
+        let sec = author.secUid ?? ""
+        _posts = StateObject(wrappedValue: DYPagedModel { cur in
+            guard !sec.isEmpty else { throw DYError.bad("没有作者信息") }
+            return try await bridge.userPosts(sec, cursor: cur)
+        })
+    }
 
     var body: some View {
-        screenBody.swipeBack { dismiss() }
+        GeometryReader { g in
+            screenBody
+                .frame(width: g.size.width, height: g.size.height)
+                .offset(x: dragX)
+                .simultaneousGesture(DragGesture(minimumDistance: 14)
+                    .onChanged { v in
+                        if axis == 0 { axis = abs(v.translation.width) > abs(v.translation.height) * 2.2 ? 1 : 2 }
+                        guard axis == 1 else { return }
+                        dragX = max(0, v.translation.width)
+                    }
+                    .onEnded { v in
+                        let wasH = axis == 1
+                        axis = 0
+                        guard wasH else { return }
+                        let fast = v.predictedEndTranslation.width - v.translation.width > 160
+                        if v.translation.width > g.size.width * 0.3 || (v.translation.width > 40 && fast) {
+                            withAnimation(.snappy(duration: 0.22)) { dragX = g.size.width } completion: { onClose() }
+                        } else {
+                            withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { dragX = 0 }
+                        }
+                    })
+        }
+        .fullScreenCover(item: $open) { t in
+            DYListPlayer(bridge: bridge, title: t.title, items: t.items, start: t.start,
+                         loadMore: t.model.map { m in { await m.loadMore() } }, onAuthor: { _ in })
+        }
     }
 
     private var screenBody: some View {
-        VStack(alignment: .leading, spacing: 16) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Button { dismiss() } label: {
+                Button { withAnimation(.snappy(duration: 0.28)) { onClose() } } label: {
                     Image(systemName: "chevron.left").font(.headline.weight(.semibold)).foregroundStyle(.white)
                         .frame(width: 44, height: 44).contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
                 .accessibilityIdentifier("douyin.author.back")
+                Text(user?.name ?? author.name).font(.headline).foregroundStyle(.white).lineLimit(1)
                 Spacer()
             }
-            if let u = user {
-                DYUserHeader(user: u)
-            } else if let err {
-                Text(err).foregroundStyle(.white.opacity(0.7)).font(.footnote)
-            } else {
-                ProgressView().tint(.white).frame(maxWidth: .infinity, minHeight: 100)
-            }
-            if let s = author.secUid, let u = URL(string: "https://www.douyin.com/user/\(s)") {
-                Button {
-                    dismiss()
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { onWeb(u) }
-                } label: {
-                    Label("查看全部作品", systemImage: "square.grid.3x3")
-                        .font(.subheadline.weight(.semibold)).foregroundStyle(.white)
-                        .frame(maxWidth: .infinity).frame(height: 44)
-                        .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(0.14)))
+            .padding(.horizontal, 8)
+            Group {
+                if let u = user {
+                    DYUserHeader(user: u)
+                } else if let err {
+                    Text(err).foregroundStyle(.white.opacity(0.7)).font(.footnote)
+                } else {
+                    ProgressView().tint(.white).frame(maxWidth: .infinity, minHeight: 80)
                 }
-                .buttonStyle(.plain)
             }
-            Spacer()
+            .padding(.horizontal, 16)
+            HStack(spacing: 6) {
+                Text("作品").font(.subheadline.weight(.bold)).foregroundStyle(.white)
+                if let u = user, u.works > 0 {
+                    Text(DYFormat.count(u.works)).font(.caption).foregroundStyle(.white.opacity(0.6))
+                }
+            }
+            .padding(.horizontal, 16)
+            DYMineList(model: posts) { i in
+                open = DYListTarget(title: user?.name ?? author.name, items: posts.items, start: i, model: posts)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            // 外屏右边有摄像头安全区（约 84pt），九宫格和视频一样铺满，不然只占左边 80%、只排得下两列
+            .ignoresSafeArea(.container, edges: [.horizontal, .bottom])
         }
-        .padding(.horizontal, 16)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(Color.black.ignoresSafeArea())
         .task {
             guard let s = author.secUid else { err = "没有作者信息"; return }
+            async let p: Void = { _ = await posts.loadMore() }()
             do { user = try await bridge.userProfile(s) } catch { err = error.localizedDescription }
+            _ = await p
         }
+    }
+}
+
+extension View {
+    /// 作者主页从右边滑进来（盖在当前页面上，不是弹窗）
+    func dyAuthorOverlay(_ author: Binding<DYAweme.Author?>, bridge: DouyinBridge) -> some View {
+        overlay {
+            if let a = author.wrappedValue {
+                DYAuthorScreen(bridge: bridge, author: a, onClose: {
+                    var t = Transaction(); t.disablesAnimations = true
+                    withTransaction(t) { author.wrappedValue = nil }
+                })
+                .transition(.move(edge: .trailing))
+                .zIndex(10)
+            }
         }
+        .animation(.snappy(duration: 0.3), value: author.wrappedValue?.secUid)
+    }
 }
 
 // MARK: - 关注流
@@ -1103,6 +1184,7 @@ struct DYFollowFeed: View {
     @State private var collected: Set<String> = []
     @State private var showComments = false
     @State private var hingeOpened = false
+    @State private var wideNow = false
 
     var body: some View {
         let m = model.model(bridge)
@@ -1156,15 +1238,19 @@ struct DYFollowFeed: View {
             }
         }
         if wide && showComments, let cur = m.items.first(where: { $0.id == currentID }) {
-            DYCommentPanel(bridge: bridge, aweme: cur, onClose: { withAnimation(.snappy) { showComments = false } })
-                .frame(width: geo.dyPanelWidth(hinge: hinge, commentsOpen: showComments))
+            DYSideComments(bridge: bridge, aweme: cur, width: geo.dyPanelWidth(hinge: hinge, commentsOpen: showComments),
+                           open: $showComments, onClosed: { hingeOpened = false })
                 .id(cur.id)
                 .transition(.move(edge: .trailing))
         }
         }
-        .sheet(isPresented: Binding(get: { showComments && !wide }, set: { showComments = $0 })) {
+        .onChange(of: wide, initial: true) { _, w in wideNow = w }
+        // b49：小屏切大屏不再把评论区丢掉（见推荐页同处说明）；小屏评论区不认横滑
+        .sheet(isPresented: Binding(get: { showComments && !wide }, set: { v in
+            if v { showComments = true } else { DispatchQueue.main.async { if !wideNow { showComments = false } } }
+        })) {
             if let cur = m.items.first(where: { $0.id == currentID }) {
-                DYCommentPanel(bridge: bridge, aweme: cur, onClose: { showComments = false })
+                DYCommentPanel(bridge: bridge, aweme: cur, onClose: { showComments = false }, horizontalDismiss: false)
                     .presentationDetents([.fraction(0.62), .large])
             }
         }
@@ -1172,11 +1258,13 @@ struct DYFollowFeed: View {
         .onChange(of: wide) { _, w in onCommentsPanel?(showComments && w ? geo.dyPanelWidth(hinge: hinge, commentsOpen: true) : 0) }
         .onChange(of: hinge) { old, new in
             // 半折叠：评论区自动跑出来；展平 / 合上时把自动打开的收回
-            if new.isHalfOpen, !showComments { withAnimation(.spring(response: 0.45, dampingFraction: 0.85)) { showComments = true }; hingeOpened = true }
-            else if old.isHalfOpen, !new.isHalfOpen, hingeOpened { withAnimation(.snappy) { showComments = false }; hingeOpened = false }
+            // b49：外层已做停稳判定，这里和外层用同一条弹簧，评论区和宽度一次到位
+            withAnimation(.spring(response: 0.42, dampingFraction: 0.9)) {
+                if new.isHalfOpen, !showComments { showComments = true; hingeOpened = true }
+                else if old.isHalfOpen, !new.isHalfOpen, hingeOpened { showComments = false; hingeOpened = false }
+            }
             onCommentsPanel?(showComments && wide ? geo.dyPanelWidth(hinge: new, commentsOpen: true) : 0)
         }
-        .animation(.spring(response: 0.45, dampingFraction: 0.85), value: hinge)
         }
         .task {
             if m.items.isEmpty { await m.loadMore() }

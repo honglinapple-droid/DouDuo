@@ -867,6 +867,7 @@ struct DouyinFeedScreen: View {
     /// 铰链状态（iPhone Duo）：半折叠且评论开着 → 视频占折痕左边、评论铺满折痕右边
     @State private var hinge: DYHinge = .none
     @State private var hingeOpenedComments = false
+    @State private var wideNow = false
     @State private var saveTask: Task<Void, Never>?
     @State private var web: DYWebTarget?
     @State private var tab: DYTab = ProcessInfo.processInfo.environment["DOUDUO_STARTLIVE"] == "1" ? .live : .recommend
@@ -894,27 +895,30 @@ struct DouyinFeedScreen: View {
                 feedArea
                 // 横屏 / 内屏默认整屏播放；点评论按钮才从右侧滑出评论栏，再点或点 × 收起
                 if wide && showComments && tab == .recommend, let cur = current {
-                    DYCommentPanel(bridge: bridge, aweme: cur, onClose: { withAnimation(.snappy) { showComments = false } })
-                        .frame(width: geo.dyPanelWidth(hinge: hinge, commentsOpen: showComments))
+                    DYSideComments(bridge: bridge, aweme: cur, width: geo.dyPanelWidth(hinge: hinge, commentsOpen: showComments),
+                                   open: $showComments, onClosed: { hingeOpenedComments = false })
                         .id(cur.id)
                         .transition(.move(edge: .trailing))
                 }
             }
-            .animation(.spring(response: 0.45, dampingFraction: 0.85), value: hinge)
-            .dyHinge($hinge)
-            .onChange(of: hinge) { old, new in
-                // 半折叠：评论区自动跑出来（视频在折痕左、评论在折痕右）；展平 / 合上时把自动打开的收回
+            // b49：姿态停稳 0.4 秒才换布局；半折叠时评论区和新宽度在同一个动画里一次出来，展平 / 合上时把自动打开的收回
+            .dyHinge($hinge) { old, new in
                 guard tab == .recommend else { return }
-                if new.isHalfOpen, !showComments { withAnimation(.spring(response: 0.45, dampingFraction: 0.85)) { showComments = true }; hingeOpenedComments = true }
-                else if old.isHalfOpen, !new.isHalfOpen, hingeOpenedComments { withAnimation(.snappy) { showComments = false }; hingeOpenedComments = false }
+                if new.isHalfOpen, !showComments { showComments = true; hingeOpenedComments = true }
+                else if old.isHalfOpen, !new.isHalfOpen, hingeOpenedComments { showComments = false; hingeOpenedComments = false }
             }
+            .onChange(of: wide, initial: true) { _, w in wideNow = w }
             .background(theme.media.strongScrim.color(for: scheme).ignoresSafeArea())
             .onAppear { insets = geo.safeAreaInsets; narrow = geo.size.width < 520 }
             .onChange(of: geo.safeAreaInsets) { _, v in insets = v }
             .onChange(of: geo.size.width) { _, w in narrow = w < 520 }
-            .sheet(isPresented: Binding(get: { showComments && !wide }, set: { showComments = $0 })) {
+            // b49：小屏开着评论展开到大屏，系统会自动收掉这个底部弹窗并顺手把开关写成「关」→ 评论区闪没。
+            // 等一拍看是不是因为变宽才收的：变宽了就保留开关，右侧评论栏接着显示同一条视频的评论
+            .sheet(isPresented: Binding(get: { showComments && !wide }, set: { v in
+                if v { showComments = true } else { DispatchQueue.main.async { if !wideNow { showComments = false } } }
+            })) {
                 if let cur = current {
-                    DYCommentPanel(bridge: bridge, aweme: cur, onClose: { showComments = false })
+                    DYCommentPanel(bridge: bridge, aweme: cur, onClose: { showComments = false }, horizontalDismiss: false)
                         .presentationDetents([.fraction(0.62), .large])
                         .presentationDragIndicator(.visible)
                 }
@@ -922,6 +926,8 @@ struct DouyinFeedScreen: View {
         }
         .background(DouyinBridgeHost(bridge: bridge).frame(width: 1, height: 1).allowsHitTesting(false))
         .background(DYIMWebHost(im: im).frame(width: 1, height: 1).allowsHitTesting(false))
+        // b49：作者主页改成从右边滑进来的全屏原生页（作品九宫格），不再是半屏卡片 + 跳网页版
+        .dyAuthorOverlay($authorTarget, bridge: bridge)
         .statusBarHidden(true)
         .defersSystemGestures(on: deferBottomGesture ? .bottom : [])
         .task {
@@ -1212,7 +1218,7 @@ struct DouyinFeedScreen: View {
             if tab == .live {
                 DYLiveFeed(bridge: bridge, model: live, onWeb: { u in web = DYWebTarget(url: u) })
             } else if tab == .follow {
-                DYFollowFeed(bridge: bridge, insets: insets, refresh: followRefresh, active: tab == .follow && web == nil && !showSearch && !showMine,
+                DYFollowFeed(bridge: bridge, insets: insets, refresh: followRefresh, active: tab == .follow && web == nil && !showSearch && !showMine && authorTarget == nil,
                              onAuthor: { a in authorTarget = a.author },
                              onLogin: { web = DYWebTarget(url: DouyinWeb.home) },
                              onToast: { showToast($0) },
@@ -1277,11 +1283,7 @@ struct DouyinFeedScreen: View {
                          onLogin: { showMine = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { web = DYWebTarget(url: DouyinWeb.home) } },
                          onAuthor: { a in authorTarget = a.author })
         }
-        .sheet(item: $authorTarget) { a in
-            DYAuthorScreen(bridge: bridge, author: a, onWeb: { u in web = DYWebTarget(url: u) })
-                .presentationDetents([.medium, .large])
-                .presentationBackground(.black)
-        }
+
 
     }
 
@@ -1369,7 +1371,7 @@ struct DouyinFeedScreen: View {
                     LazyVStack(spacing: 0) {
                         ForEach(feed.items) { item in
                             DYVideoPage(item: item,
-                                        isCurrent: item.id == currentID && web == nil && tab == .recommend && !showSearch && !showMine && !showMessages,
+                                        isCurrent: item.id == currentID && web == nil && tab == .recommend && !showSearch && !showMine && !showMessages && authorTarget == nil,
                                         insets: insets,
                                         resume: resume[item.id],
                                         liked: feed.liked.contains(item.id),
@@ -2321,6 +2323,11 @@ struct DYCommentPanel: View {
     let bridge: DouyinBridge
     let aweme: DYAweme
     let onClose: (() -> Void)?
+    /// b49：小屏底部弹出的评论区传 false → 不认任何横滑，只能下拉关
+    var horizontalDismiss = true
+    /// b49：外面接管跟手（侧栏让出多少、视频就变宽多少）：拖动中报位移，松手报「要不要关」
+    var onDrag: ((CGFloat) -> Void)?
+    var onDragEnd: ((Bool) -> Void)?
     @State private var items: [DYComment] = []
     @State private var cursor = 0
     @State private var hasMore = true
@@ -2341,33 +2348,46 @@ struct DYCommentPanel: View {
     @State private var failedDrafts: [String: (text: String, replyID: String?)] = [:]
     @FocusState private var inputFocused: Bool
 
-    init(bridge: DouyinBridge, aweme: DYAweme, onClose: (() -> Void)?) {
+    init(bridge: DouyinBridge, aweme: DYAweme, onClose: (() -> Void)?, horizontalDismiss: Bool = true,
+         onDrag: ((CGFloat) -> Void)? = nil, onDragEnd: ((Bool) -> Void)? = nil) {
         self.bridge = bridge; self.aweme = aweme; self.onClose = onClose
+        self.horizontalDismiss = horizontalDismiss; self.onDrag = onDrag; self.onDragEnd = onDragEnd
     }
 
-    /// 跟手：面板随手指向右移动，松手超过面板宽 35% 或甩得够快就收起，否则弹回；向左一滑（>80pt）也收起
+    /// 跟手：面板随手指向右移动，松手超过面板宽 35% 或往右甩得够快就收起，否则弹回；向左一滑（>80pt）也收起。
+    /// b49：手指刚动的一小段就锁方向——只有接近水平（偏离 < 约 24°）才算横滑，一旦判成上下滑，这一整次都不会触发关闭
+    /// （原来斜着快速上滑，带一点横向速度就被当成右滑关掉了）。
     @State private var dragX: CGFloat = 0
+    @State private var axis = 0   // 0 未定 / 1 横 / 2 竖
     var body: some View {
         GeometryReader { g in
             panelBody
                 .offset(x: dragX)
-                .simultaneousGesture(DragGesture(minimumDistance: 18)
+                .simultaneousGesture(DragGesture(minimumDistance: 14)
                     .onChanged { v in
-                        guard abs(v.translation.width) > abs(v.translation.height) * 1.2 else { return }
-                        dragX = max(0, v.translation.width)
+                        if axis == 0 {
+                            let dx = abs(v.translation.width), dy = abs(v.translation.height)
+                            axis = dx > dy * 2.2 ? 1 : 2
+                        }
+                        guard axis == 1 else { return }
+                        let x = max(0, v.translation.width)
+                        if let onDrag { onDrag(x) } else { dragX = x }
                     }
                     .onEnded { v in
+                        let wasH = axis == 1
+                        axis = 0
+                        guard wasH else { return }
                         let w = max(g.size.width, 1)
-                        let fast = v.predictedEndTranslation.width - v.translation.width > 120
-                        if v.translation.width > w * 0.35 || (v.translation.width > 40 && fast) {
+                        let fast = v.predictedEndTranslation.width - v.translation.width > 160
+                        let close = v.translation.width > w * 0.35 || (v.translation.width > 40 && fast) || v.translation.width < -80
+                        if let onDragEnd { onDragEnd(close); return }
+                        if close {
                             onClose?()
                             DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { dragX = 0 }
-                        } else if v.translation.width < -80, abs(v.translation.height) < 70 {
-                            onClose?()
                         } else {
                             withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { dragX = 0 }
                         }
-                    })
+                    }, including: horizontalDismiss ? .all : .subviews)
         }
     }
 
@@ -2581,6 +2601,36 @@ struct DYCommentPanel: View {
         } catch {
             self.error = error.localizedDescription
             hasMore = false
+        }
+    }
+}
+
+
+/// b49：宽屏右侧评论栏外壳——拖动时评论栏让出多少，左边视频就实时变宽多少（原来要等评论栏完全划走视频才一下子变回去）。
+/// 关闭（× / 右滑 / 左滑）都先把评论栏收窄到 0，再无动画移除，所以视频是连续变宽的。
+struct DYSideComments: View {
+    let bridge: DouyinBridge
+    let aweme: DYAweme
+    let width: CGFloat
+    @Binding var open: Bool
+    var onClosed: (() -> Void)? = nil
+    @State private var drag: CGFloat = 0
+
+    var body: some View {
+        DYCommentPanel(bridge: bridge, aweme: aweme, onClose: { close() },
+                       onDrag: { drag = min($0, width) },
+                       onDragEnd: { c in
+                           if c { close() } else { withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { drag = 0 } }
+                       })
+            .frame(width: width)
+            .frame(width: max(0, width - drag), alignment: .leading)
+            .clipped()
+    }
+
+    private func close() {
+        withAnimation(.snappy(duration: 0.24)) { drag = width } completion: {
+            var t = Transaction(); t.disablesAnimations = true
+            withTransaction(t) { open = false; onClosed?() }
         }
     }
 }
