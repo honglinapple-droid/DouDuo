@@ -223,11 +223,15 @@ private enum DYIMJS {
     const m = await openMenu(box);
     if (!m) return JSON.stringify({ ok: false, why: 'no-menu' });
     const cells = [...m.querySelectorAll('.PopBodyEmojiQuickReplyemojiCell')];
-    if (!cells[idx]) { closeMenu(); return JSON.stringify({ ok: false, why: 'no-emoji' }); }
-    fire(cells[idx]);
+    const key = x => { const i = x.querySelector('img'); return (i && (i.alt || i.title)) || txt(x) || ''; };
+    const emojis = cells.map(key);
+    // b52：按表情名字找，不按位置——抖音的快捷表情会按最近用过的重新排序，按位置点会点成别的表情
+    const cell = name ? cells.find(x => key(x) === name) : cells[idx];
+    if (!cell) { closeMenu(); return JSON.stringify({ ok: false, why: 'no-emoji', emojis }); }
+    fire(cell);
     await sleep(500);
     closeMenu();
-    return JSON.stringify({ ok: true });
+    return JSON.stringify({ ok: true, emojis });
     """#
 
     /// 把第 box 条消息转发给朋友：菜单「分享」→「选择朋友」面板里找到那个人 → 点他旁边的「发送」
@@ -676,7 +680,7 @@ final class DYIMModel: ObservableObject {
     }
 
     private struct MenuInfo: Decodable { let ok: Bool; let items: [String]?; let emojis: [String]? }
-    private struct ActionResp: Decodable { let ok: Bool; let confirmed: Bool?; let reference: String?; let why: String? }
+    private struct ActionResp: Decodable { let ok: Bool; let confirmed: Bool?; let reference: String?; let why: String?; var emojis: [String]? = nil }
     struct PageState: Decodable, CustomStringConvertible {
         let href: String; let ready: String; let title: String; let w: Int; let h: Int; let vis: String
         let share: Bool; let shareW: Int; let im: Bool; let videos: Int; let text: String
@@ -705,8 +709,10 @@ final class DYIMModel: ObservableObject {
         replyingTo = nil
     }
 
-    func quickEmoji(_ idx: Int, on m: DYIMMessage) async -> Bool {
-        guard let r = try? await web.eval(DYIMJS.quickEmoji, ["box": m.box, "idx": idx], as: ActionResp.self), r.ok else { return false }
+    func quickEmoji(_ idx: Int, name: String, on m: DYIMMessage) async -> Bool {
+        let r = try? await web.eval(DYIMJS.quickEmoji, ["box": m.box, "idx": idx, "name": name], as: ActionResp.self)
+        if let e = r?.emojis, !e.isEmpty { quickEmojis = e }   // 下次弹出的这排和网页当前顺序一致
+        guard let r, r.ok else { return false }
         await refreshMessages()
         return true
     }
@@ -828,7 +834,7 @@ struct DYFollowSwipeBack: ViewModifier {
                 guard was else { return }
                 let t = v.translation.width
                 if t > width * 0.3 || (t > 30 && v.predictedEndTranslation.width > width * 0.5) {
-                    withAnimation(.easeOut(duration: 0.22)) { dx = width } completion: {
+                    withAnimation(.easeOut(duration: 0.22)) { dx = width + 30 } completion: {
                         var tr = Transaction(); tr.disablesAnimations = true
                         withTransaction(tr) { action() }
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { dx = 0 }
@@ -844,7 +850,9 @@ struct DYFollowSwipeBack: ViewModifier {
             .background(Color.black.ignoresSafeArea())
             .offset(x: dx)
             .shadow(color: .black.opacity(dx > 0 ? 0.45 : 0), radius: 14, x: -6)
-            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = max($0, 1) }
+            // b52：要算上左右安全区——外屏右边有约 84pt 摄像头安全区，只用内容宽（382）会让页面滑到 82% 就停住、
+            // 在右边留一条，0.2 秒后整页突然消失（用户看到的「闪一下、两个页面重叠」）。整屏宽 + 阴影余量才滑得出去
+            .onGeometryChange(for: CGFloat.self) { $0.size.width + $0.safeAreaInsets.leading + $0.safeAreaInsets.trailing } action: { width = max($0, 1) }
             .simultaneousGesture(drag)
             // 所在的全屏页底色透明 → 拖动时能看见底下的页面（不在全屏页里时无效果）
             .presentationBackground(.clear)
@@ -1069,7 +1077,11 @@ struct DYChatScreen: View {
         .alert("发送失败，再试一次", isPresented: $failed) { Button("好", role: .cancel) {} }
         .sheet(item: $menuFor) { m in
             DYMessageMenu(message: m, items: menuItems, emojis: im.quickEmojis,
-                          onEmoji: { i in menuFor = nil; Task { if !(await im.quickEmoji(i, on: m)) { show("没发出去") } } },
+                          onEmoji: { i in
+                              let name = i < im.quickEmojis.count ? im.quickEmojis[i] : ""
+                              menuFor = nil
+                              Task { if !(await im.quickEmoji(i, name: name, on: m)) { show("这个表情没发出去，再长按一次试试") } }
+                          },
                           onAction: { a in
                               menuFor = nil
                               switch a {

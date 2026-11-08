@@ -43,6 +43,8 @@ struct DYHingeObserver: ViewModifier {
     var onSettle: ((DYHinge, DYHinge) -> Void)?
     @State private var pending: DYHinge?
     @State private var settleTask: Task<Void, Never>?
+    /// b52：最近一次「大动」时的铰链角度（度）。半折要等角度停下来才算数
+    @State private var anchor: Double = 0
 
     func body(content: Content) -> some View {
         if #available(iOS 27.1, *) {
@@ -56,27 +58,35 @@ struct DYHingeObserver: ViewModifier {
                     default: h = .none
                     }
                 } else { h = .none }
-                propose(h)
+                propose(h, angle: ctx.hinge?.angle.degrees ?? 0)
             }
         } else {
             content
         }
     }
 
-    private func propose(_ h: DYHinge) {
+    private func propose(_ h: DYHinge, angle: Double) {
         // 第一次拿到状态（启动时）直接用，不做动画
-        if hinge == .none && pending == nil { hinge = h; return }
-        // b50：折的过程中系统会不停报角度，状态没变也会回调。b49 每次回调都重新计时 → 手不停、计时就不停 → 折完 2–3 秒才跟过来。
-        // 现在状态没变就不动计时器；回到当前状态就取消等待。
+        if hinge == .none && pending == nil { hinge = h; anchor = angle; return }
         // b51：从合上打开时一律不进半折——展开途中路过的半折不算数，等到全开再说；半折只在「已经全开、再往回折」时才触发
         var h = h
         if h == .partiallyOpen && (hinge == .closed || hinge == .none) { h = hinge }
-        if h == pending { return }
+        if h == pending {
+            // b52：苹果的铰链除了状态还给实时角度。合上的途中会路过半折，那时角度一直在变 → 每动 4° 以上就重新计时，
+            // 一直到合上都不会触发；手停下来（真要半折用）0.22 秒后才换布局。b50 只看状态、0.12 秒就触发 → 合上时评论区弹一下
+            if h == .partiallyOpen, abs(angle - anchor) > 4 { anchor = angle; schedule(h) }
+            return
+        }
         if h == hinge { pending = nil; settleTask?.cancel(); return }
         pending = h
+        anchor = angle
+        schedule(h)
+    }
+
+    private func schedule(_ h: DYHinge) {
         settleTask?.cancel()
-        // 从平板折成半折（用户有意要分屏）几乎立刻响应；从合上展开时会路过半折，多等一下免得来回跳
-        let wait: UInt64 = (hinge == .closed || hinge == .none) ? 350_000_000 : 120_000_000
+        // 半折：等角度停稳 0.22 秒；合上 → 全开 0.35 秒；全开 → 合上 0.12 秒
+        let wait: UInt64 = h == .partiallyOpen ? 220_000_000 : ((hinge == .closed || hinge == .none) ? 350_000_000 : 120_000_000)
         settleTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: wait)
             guard !Task.isCancelled, let p = pending, p == h else { return }

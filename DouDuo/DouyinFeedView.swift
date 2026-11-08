@@ -918,14 +918,18 @@ struct DouyinFeedScreen: View {
                 if new.isHalfOpen, !showComments { showComments = true; hingeOpenedComments = true }
                 else if old.isHalfOpen, !new.isHalfOpen, hingeOpenedComments { showComments = false; hingeOpenedComments = false }
             }
-            .onChange(of: wide, initial: true) { _, w in wideNow = w }
+            .onChange(of: wide, initial: true) { _, w in
+                wideNow = w
+                // b52：半折时自动打开的评论区，合上切到小屏时直接收掉，不能变成小屏底部弹窗闪一下
+                if !w && hingeOpenedComments { var t = Transaction(); t.disablesAnimations = true; withTransaction(t) { showComments = false; hingeOpenedComments = false } }
+            }
             .background(theme.media.strongScrim.color(for: scheme).ignoresSafeArea())
             .onAppear { insets = geo.safeAreaInsets; narrow = geo.size.width < 520 }
             .onChange(of: geo.safeAreaInsets) { _, v in insets = v }
             .onChange(of: geo.size.width) { _, w in narrow = w < 520 }
             // b49：小屏开着评论展开到大屏，系统会自动收掉这个底部弹窗并顺手把开关写成「关」→ 评论区闪没。
             // 等一拍看是不是因为变宽才收的：变宽了就保留开关，右侧评论栏接着显示同一条视频的评论
-            .sheet(isPresented: Binding(get: { showComments && !wide }, set: { v in
+            .sheet(isPresented: Binding(get: { showComments && !wide && !hingeOpenedComments }, set: { v in
                 if v { showComments = true } else { DispatchQueue.main.async { if !wideNow { showComments = false } } }
             })) {
                 if let cur = current {

@@ -1365,9 +1365,13 @@ struct DYFollowFeed: View {
                 .transition(.move(edge: .trailing).combined(with: .opacity))
         }
         }
-        .onChange(of: wide, initial: true) { _, w in wideNow = w }
+        .onChange(of: wide, initial: true) { _, w in
+            wideNow = w
+            // b52：半折自动打开的评论区，合上切到小屏时直接收掉（同推荐页）
+            if !w && hingeOpened { var t = Transaction(); t.disablesAnimations = true; withTransaction(t) { showComments = false; hingeOpened = false } }
+        }
         // b49：小屏切大屏不再把评论区丢掉（见推荐页同处说明）；小屏评论区不认横滑
-        .sheet(isPresented: Binding(get: { showComments && !wide }, set: { v in
+        .sheet(isPresented: Binding(get: { showComments && !wide && !hingeOpened }, set: { v in
             if v { showComments = true } else { DispatchQueue.main.async { if !wideNow { showComments = false } } }
         })) {
             if let cur = m.items.first(where: { $0.id == currentID }) {
