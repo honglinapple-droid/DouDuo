@@ -544,6 +544,8 @@ final class DYIMModel: ObservableObject {
     }
 
     func refreshList() async {
+        // b50：没登录时网页消息面板认不出「未登录」→ 一直转圈。先看 cookie 里有没有 sessionid，没有就直接显示「还没登录抖音」
+        guard await DYSession.loggedIn() else { loggedIn = false; return }
         guard !sharing, await ensurePanel() else { return }
         do {
             let r = try await web.eval(DYIMJS.list, as: ListResp.self)
@@ -799,31 +801,58 @@ final class DYIMModel: ObservableObject {
 
 // MARK: - 通用：左边缘右滑 = 返回（只占最左边 24pt 的隐形条，不和列表滚动打架）
 
-struct DYEdgeSwipeBack: ViewModifier {
+/// b50：右滑返回统一改成「跟手」——页面跟着手指往右移，底下的页面露出来，松手过 30%（或甩得够快）就顺势滑出去再关，
+/// 否则弹回。原来是滑够距离直接 dismiss，全屏页按系统默认往下收，手往右划页面往左下角掉，很廉价。
+/// edgeOnly：视频列表 / 网页里横滑另有用途（快进、网页滚动），只认最左 24pt 起手。
+/// 配合每个全屏页的 `.presentationBackground(.clear)`，拖动时才能看见底下的页面。
+struct DYFollowSwipeBack: ViewModifier {
+    let edgeOnly: Bool
     let action: () -> Void
-    func body(content: Content) -> some View {
-        content.overlay(alignment: .leading) {
-            Color.clear.frame(width: 24).contentShape(Rectangle())
-                .gesture(DragGesture(minimumDistance: 16).onEnded { v in
-                    if v.translation.width > 60 && abs(v.translation.height) < 90 { action() }
-                })
-        }
+    @State private var dx: CGFloat = 0
+    @State private var axis = 0          // 0 未定 / 1 横（返回）/ 2 其他
+    @State private var width: CGFloat = 400
+
+    private var drag: some Gesture {
+        DragGesture(minimumDistance: edgeOnly ? 8 : 16, coordinateSpace: .global)
+            .onChanged { v in
+                if axis == 0 {
+                    let fromEdge = !edgeOnly || v.startLocation.x < 28
+                    axis = (fromEdge && v.translation.width > 0 && v.translation.width > abs(v.translation.height) * 2) ? 1 : 2
+                }
+                guard axis == 1 else { return }
+                dx = max(0, v.translation.width)
+            }
+            .onEnded { v in
+                let was = axis == 1
+                axis = 0
+                guard was else { return }
+                let t = v.translation.width
+                if t > width * 0.3 || (t > 30 && v.predictedEndTranslation.width > width * 0.5) {
+                    withAnimation(.easeOut(duration: 0.22)) { dx = width } completion: {
+                        var tr = Transaction(); tr.disablesAnimations = true
+                        withTransaction(tr) { action() }
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { dx = 0 }
+                    }
+                } else {
+                    withAnimation(.spring(response: 0.35, dampingFraction: 0.86)) { dx = 0 }
+                }
+            }
     }
-}
-/// 整屏右滑返回（b46）：任意位置向右滑过 90pt、竖向偏移小于 70pt 就返回。
-/// 之前只有最左 24pt 一条带手势的透明条——它会吞掉底下返回箭头的点击，搜索 / 我的 / 作者页的返回键因此点不动，
-/// 消息 / 聊天的返回键一半在条下所以时灵时不灵。视频列表页横滑是快进，仍用边缘条。
-struct DYSwipeBack: ViewModifier {
-    let action: () -> Void
+
     func body(content: Content) -> some View {
-        content.simultaneousGesture(DragGesture(minimumDistance: 24).onEnded { v in
-            if v.translation.width > 90, abs(v.translation.height) < 70, v.translation.width > abs(v.translation.height) * 2 { action() }
-        })
+        content
+            .background(Color.black.ignoresSafeArea())
+            .offset(x: dx)
+            .shadow(color: .black.opacity(dx > 0 ? 0.45 : 0), radius: 14, x: -6)
+            .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { width = max($0, 1) }
+            .simultaneousGesture(drag)
+            // 所在的全屏页底色透明 → 拖动时能看见底下的页面（不在全屏页里时无效果）
+            .presentationBackground(.clear)
     }
 }
 extension View {
-    func swipeBack(_ action: @escaping () -> Void) -> some View { modifier(DYSwipeBack(action: action)) }
-    func edgeSwipeBack(_ action: @escaping () -> Void) -> some View { modifier(DYEdgeSwipeBack(action: action)) }
+    func swipeBack(_ action: @escaping () -> Void) -> some View { modifier(DYFollowSwipeBack(edgeOnly: false, action: action)) }
+    func edgeSwipeBack(_ action: @escaping () -> Void) -> some View { modifier(DYFollowSwipeBack(edgeOnly: true, action: action)) }
 }
 
 // MARK: - 界面（照手机版抖音）
@@ -847,7 +876,8 @@ struct DYMessagesScreen: View {
     }
 
     var body: some View {
-        NavigationStack {
+        // b50：聊天页不再走导航推入，NavigationStack 去掉（它自带不透明底色，右滑时会挡住底下的推荐页）
+        ZStack {
             VStack(spacing: 0) {
                 HStack {
                     Button(action: onClose) {
@@ -896,10 +926,17 @@ struct DYMessagesScreen: View {
             }
             .background(dyBG.ignoresSafeArea())
             .swipeBack { onClose() }
-            .navigationDestination(item: $open) { c in
+        }
+        // b50：聊天页改成从右边滑进来、盖在消息列表上（原来是导航推入，右滑时底下是黑的）。
+        // 右滑跟手时能看见下面的消息列表；返回键是往右滑出去。
+        .overlay {
+            if let c = open {
                 DYChatScreen(im: im, bridge: bridge, conversation: c, onBack: { open = nil }, onAuthor: onAuthor)
+                    .transition(.move(edge: .trailing))
+                    .zIndex(1)
             }
         }
+        .animation(.spring(response: 0.38, dampingFraction: 0.9), value: open?.id)
         .onAppear { im.listVisible = true; im.start(); im.startListPolling(); openPending() }
         .onChange(of: im.conversations) { _, _ in openPending() }
         .onDisappear { im.listVisible = false }
@@ -1281,7 +1318,7 @@ struct DYFriendPicker: View {
                 Spacer()
                 Text(title).font(.headline).foregroundStyle(.white)
                 Spacer()
-                Color.clear.frame(width: 40)
+                Color.clear.frame(width: 40, height: 1)  // b50：只给宽度会把标题行撑满整个面板高度（标题掉到中间）
             }
             .padding(.horizontal, 16).padding(.vertical, 12)
             HStack(spacing: 6) {

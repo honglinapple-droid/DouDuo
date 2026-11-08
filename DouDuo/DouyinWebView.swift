@@ -96,7 +96,6 @@ struct DouyinWebScreen: View {
                 theme.media.strongScrim.color(for: scheme).ignoresSafeArea()
                 DouyinWebContainer(model: model, zoom: zoom, start: start)
                     .ignoresSafeArea(edges: [.bottom, .horizontal])
-                    .edgeSwipeBack { dismiss() }
                 if model.progress < 1 {
                     ProgressView(value: model.progress)
                         .tint(theme.accent.color(for: scheme))
@@ -119,6 +118,7 @@ struct DouyinWebScreen: View {
                 .padding(.leading, 10)
                 .padding(.top, 4)
             }
+            .edgeSwipeBack { dismiss() }
         }
     }
 

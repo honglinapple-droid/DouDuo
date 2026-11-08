@@ -36,7 +36,7 @@ enum DYHinge: Equatable {
 
 /// 监听铰链：iOS 27.1 起用苹果的 `onHingeChange`，低版本不挂。
 /// b49：苹果的说法是「铰链实时数据只适合做特效，换布局要等姿态定下来」。慢慢展开时铰链会依次报
-/// 合上 → 半折 → 全开，每报一次就换一次布局会来回跳 → 加「停稳判定」：同一个姿态保持 0.4 秒才算数，
+/// 合上 → 半折 → 全开，每报一次就换一次布局会来回跳 → 加「停稳判定」：b50：平板→半折 0.12 秒响应、合上→展开途中 0.35 秒（防路过半折乱跳）；角度回调不再重置计时，
 /// 途中路过的姿态一律不理；定下来以后把「新姿态 + 评论区开关」放进同一个动画一次做完。
 struct DYHingeObserver: ViewModifier {
     @Binding var hinge: DYHinge
@@ -66,15 +66,21 @@ struct DYHingeObserver: ViewModifier {
     private func propose(_ h: DYHinge) {
         // 第一次拿到状态（启动时）直接用，不做动画
         if hinge == .none && pending == nil { hinge = h; return }
+        // b50：折的过程中系统会不停报角度，状态没变也会回调。b49 每次回调都重新计时 → 手不停、计时就不停 → 折完 2–3 秒才跟过来。
+        // 现在状态没变就不动计时器；回到当前状态就取消等待。
+        if h == pending { return }
+        if h == hinge { pending = nil; settleTask?.cancel(); return }
         pending = h
         settleTask?.cancel()
+        // 从平板折成半折（用户有意要分屏）几乎立刻响应；从合上展开时会路过半折，多等一下免得来回跳
+        let wait: UInt64 = (hinge == .closed || hinge == .none) ? 350_000_000 : 120_000_000
         settleTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: 400_000_000)
+            try? await Task.sleep(nanoseconds: wait)
             guard !Task.isCancelled, let p = pending, p == h else { return }
             pending = nil
             let old = hinge
             guard old != p else { return }
-            withAnimation(.spring(response: 0.42, dampingFraction: 0.9)) {
+            withAnimation(DYHingeAnim.layout) {
                 hinge = p
                 onSettle?(old, p)
             }
@@ -121,4 +127,18 @@ enum DYMute {
         return false
         #endif
     }()
+}
+
+/// 折叠换布局的动画：评论栏滑入 + 视频收窄同一条弹簧（约 0.45 秒，带一点点回弹，跟手机系统动画一个味道）
+enum DYHingeAnim {
+    static let layout: Animation = .spring(response: 0.42, dampingFraction: 0.88)
+}
+
+/// 私信模型放进环境里：从任何地方点开的视频（聊天里朋友发的、搜索、我的、作者主页）转发都走「发给朋友」，不走系统分享
+private struct DYIMEnvKey: EnvironmentKey { nonisolated(unsafe) static let defaultValue: DYIMModel? = nil }
+extension EnvironmentValues {
+    var dyIM: DYIMModel? {
+        get { self[DYIMEnvKey.self] }
+        set { self[DYIMEnvKey.self] = newValue }
+    }
 }

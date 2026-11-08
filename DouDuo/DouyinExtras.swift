@@ -1,6 +1,7 @@
 // DouDuo 扩展功能：搜索 / 我的（喜欢·收藏·历史·稍后再看）/ 关注 / 作者主页 / 弹幕 / 楼中楼 / 保存到相册
 // 全部接口都走隐藏签名页（DouyinBridge.call），和推荐流同一套签名，不逆向。
 import SwiftUI
+import WebKit
 import Combine
 import AVFoundation
 import Photos
@@ -25,6 +26,8 @@ struct DYUser: Decodable, Equatable {
     let likes: Int
     let works: Int
     let ip: String?
+    /// b50：0 没关注 / 1 已关注 / 2 互相关注（作者主页「关注」按钮用；接口没给就是 nil）
+    var followStatus: Int? = nil
 }
 
 struct DYSug: Identifiable, Decodable, Equatable {
@@ -213,7 +216,8 @@ extension DouyinBridge {
     private static let userMap = #"""
     const umap = u => u ? ({ name: u.nickname || '', avatar: first(u.avatar_larger) || first(u.avatar_thumb), signature: u.signature || '',
       secUid: u.sec_uid || '', followers: u.follower_count || u.mplatform_followers_count || 0, following: u.following_count || 0,
-      likes: u.total_favorited || 0, works: u.aweme_count || 0, ip: u.ip_location || null }) : null;
+      likes: u.total_favorited || 0, works: u.aweme_count || 0, ip: u.ip_location || null,
+      followStatus: (u.follow_status != null) ? u.follow_status : null }) : null;
     """#
 
     static let selfJS = userMap + #"""
@@ -554,6 +558,8 @@ struct DYListPlayer: View {
     @State private var author: DYAweme.Author?
     @State private var toast: String?
     @State private var loadingMore = false
+    @State private var shareTarget: DYAweme?
+    @Environment(\.dyIM) private var im
 
     init(bridge: DouyinBridge, title: String, items: [DYAweme], start: Int,
          loadMore: (() async -> [DYAweme])? = nil, onAuthor: @escaping (DYAweme) -> Void) {
@@ -585,7 +591,8 @@ struct DYListPlayer: View {
                                         onComments: { showComments = true },
                                         onAuthor: { author = item.author },
                                         onSavePosition: { resume[item.id] = $0 }, preloader: preloader,
-                                        bridge: bridge, onToast: { show($0) })
+                                        bridge: bridge, onToast: { show($0) },
+                                        onShare: im == nil ? nil : { shareTarget = item })
                                 .containerRelativeFrame([.horizontal, .vertical])
                                 .id(item.id)
                         }
@@ -626,12 +633,23 @@ struct DYListPlayer: View {
             if wide && showComments, let cur = current {
                 DYSideComments(bridge: bridge, aweme: cur, width: min(380, geo.size.width * 0.36), open: $showComments)
                     .id(cur.id)
-                    .transition(.move(edge: .trailing))
+                    .transition(.move(edge: .trailing).combined(with: .opacity))
             }
             }
             .onChange(of: wide, initial: true) { _, w in wideNow = w }
         }
         .dyAuthorOverlay($author, bridge: bridge)
+        // b50：朋友发来的视频 / 搜索 / 我的 / 作者主页里点开的视频，转发也是「发给朋友」（和推荐页同一个面板）
+        .sheet(item: $shareTarget) { a in
+            if let im {
+                DYFriendPicker(im: im, title: "发送给朋友") { friend in
+                    show("发送中…")
+                    Task { if await im.shareVideo(a.id, to: friend) { show("已分享给 \(friend.name)") } else { show(im.lastSendError ?? "没发出去") } }
+                }
+                .presentationDetents([.medium, .large])
+                .presentationBackground(Color(red: 0.12, green: 0.12, blue: 0.13))
+            }
+        }
         .statusBarHidden(true)
         .edgeSwipeBack { dismiss() }
         .onChange(of: currentID) { old, new in
@@ -1053,6 +1071,11 @@ struct DYAuthorScreen: View {
     @State private var open: DYListTarget?
     @State private var dragX: CGFloat = 0
     @State private var axis = 0
+    /// b50：关注按钮。nil = 还不知道（接口没回来），按作者卡片带的状态先显示
+    @State private var following: Bool?
+    @State private var followBusy = false
+    @State private var confirmUnfollow = false
+    @State private var toast: String?
 
     init(bridge: DouyinBridge, author: DYAweme.Author, onClose: @escaping () -> Void) {
         self.bridge = bridge; self.author = author; self.onClose = onClose
@@ -1068,7 +1091,7 @@ struct DYAuthorScreen: View {
             screenBody
                 .frame(width: g.size.width, height: g.size.height)
                 .offset(x: dragX)
-                .simultaneousGesture(DragGesture(minimumDistance: 14)
+                .simultaneousGesture(DragGesture(minimumDistance: 14, coordinateSpace: .global)
                     .onChanged { v in
                         if axis == 0 { axis = abs(v.translation.width) > abs(v.translation.height) * 2.2 ? 1 : 2 }
                         guard axis == 1 else { return }
@@ -1115,6 +1138,7 @@ struct DYAuthorScreen: View {
                 }
             }
             .padding(.horizontal, 16)
+            if user != nil, author.secUid != nil { followButton.padding(.horizontal, 16) }
             HStack(spacing: 6) {
                 Text("作品").font(.subheadline.weight(.bold)).foregroundStyle(.white)
                 if let u = user, u.works > 0 {
@@ -1131,13 +1155,110 @@ struct DYAuthorScreen: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
         .background(Color.black.ignoresSafeArea())
+        .overlay {
+            if let t = toast {
+                Text(t).font(.footnote.weight(.medium)).foregroundStyle(.white)
+                    .padding(.horizontal, 14).padding(.vertical, 8)
+                    .background(Capsule().fill(.black.opacity(0.72)))
+                    .transition(.opacity)
+                    .allowsHitTesting(false)
+            }
+        }
+        .animation(.easeOut(duration: 0.2), value: toast)
+        .confirmationDialog("不再关注 \(user?.name ?? author.name)？", isPresented: $confirmUnfollow, titleVisibility: .visible) {
+            Button("取消关注", role: .destructive) { setFollow(false) }
+            Button("再想想", role: .cancel) {}
+        }
         .task {
             guard let s = author.secUid else { err = "没有作者信息"; return }
+            if let known = DYFollowState.shared.state[s] { following = known }
             async let p: Void = { _ = await posts.loadMore() }()
-            do { user = try await bridge.userProfile(s) } catch { err = error.localizedDescription }
+            do {
+                let u = try await bridge.userProfile(s)
+                user = u
+                // 没登录时抖音接口的 follow_status 不可信（实测游客也会回 1）→ 只有真登录了才按接口显示「已关注」
+                let logged = await DYSession.loggedIn()
+                if following == nil {
+                    let st = u.followStatus ?? author.followStatus ?? 0
+                    // 刚在推荐页点过加号（或取消）的，以这次点的为准；接口有时慢半拍
+                    following = DYFollowState.shared.state[s] ?? (logged && (st == 1 || st == 2))
+                }
+            } catch { err = error.localizedDescription }
             _ = await p
         }
     }
+
+    /// 红色「关注」/ 灰色「已关注」，和抖音主页一样；点已关注先确认再取消，免得手滑
+    private var followButton: some View {
+        let on = following ?? false
+        return Button {
+            if on { confirmUnfollow = true } else { setFollow(true) }
+        } label: {
+            HStack(spacing: 6) {
+                if followBusy { ProgressView().controlSize(.small).tint(.white) }
+                else { Image(systemName: on ? "checkmark" : "plus").font(.subheadline.weight(.bold)) }
+                Text(on ? "已关注" : "关注").font(.subheadline.weight(.semibold))
+            }
+            .foregroundStyle(.white)
+            .frame(maxWidth: .infinity, minHeight: 40)
+            .background(RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .fill(on ? Color.white.opacity(0.14) : Color(red: 0.996, green: 0.173, blue: 0.333)))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .disabled(followBusy)
+        .animation(.snappy(duration: 0.22), value: on)
+        .accessibilityIdentifier("douyin.author.follow")
+    }
+
+    private func setFollow(_ want: Bool) {
+        guard let sec = author.secUid, !followBusy else { return }
+        let before = following
+        following = want; followBusy = true
+        Task {
+            var msg: String
+            do {
+                switch try await bridge.follow(sec, follow: want) {
+                case .ok:
+                    msg = want ? "已关注" : "已取消关注"
+                    DYFollowState.shared.set(sec, want)
+                case .notLoggedIn: following = before; msg = "抖音未登录：菜单 → 网页版 / 登录"
+                case .failed(let why): following = before; msg = (want ? "关注失败：" : "取消失败：") + why
+                }
+            } catch { following = before; msg = (want ? "关注失败：" : "取消失败：") + error.localizedDescription }
+            followBusy = false
+            say(msg)
+        }
+    }
+
+    private func say(_ s: String) {
+        toast = s
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { if toast == s { toast = nil } }
+    }
+}
+
+/// 登录态：看 WebView 里有没有抖音的 sessionid（HttpOnly，网页 JS 读不到，原生这边能读到）
+enum DYSession {
+    @MainActor static func loggedIn() async -> Bool {
+        let cs = await WKWebsiteDataStore.default().httpCookieStore.allCookies()
+        return cs.contains { $0.name == "sessionid" && $0.domain.contains("douyin") && !$0.value.isEmpty }
+    }
+}
+
+/// b50：这次打开 App 里点过的关注 / 取消关注（推荐页加号、作者主页按钮共用同一份，两边永远对得上）
+@MainActor
+final class DYFollowState: ObservableObject {
+    static let shared = DYFollowState()
+    @Published private(set) var state: [String: Bool] = [:]
+    func set(_ sec: String, _ on: Bool) {
+        state[sec] = on
+        NotificationCenter.default.post(name: .dyFollowChanged, object: nil, userInfo: ["sec": sec, "on": on])
+    }
+}
+
+extension Notification.Name {
+    /// 作者主页点了关注 / 取消关注 → 推荐页头像上的「+」同步
+    static let dyFollowChanged = Notification.Name("dyFollowChanged")
 }
 
 extension View {
@@ -1241,7 +1362,7 @@ struct DYFollowFeed: View {
             DYSideComments(bridge: bridge, aweme: cur, width: geo.dyPanelWidth(hinge: hinge, commentsOpen: showComments),
                            open: $showComments, onClosed: { hingeOpened = false })
                 .id(cur.id)
-                .transition(.move(edge: .trailing))
+                .transition(.move(edge: .trailing).combined(with: .opacity))
         }
         }
         .onChange(of: wide, initial: true) { _, w in wideNow = w }
@@ -1259,7 +1380,7 @@ struct DYFollowFeed: View {
         .onChange(of: hinge) { old, new in
             // 半折叠：评论区自动跑出来；展平 / 合上时把自动打开的收回
             // b49：外层已做停稳判定，这里和外层用同一条弹簧，评论区和宽度一次到位
-            withAnimation(.spring(response: 0.42, dampingFraction: 0.9)) {
+            withAnimation(DYHingeAnim.layout) {
                 if new.isHalfOpen, !showComments { showComments = true; hingeOpened = true }
                 else if old.isHalfOpen, !new.isHalfOpen, hingeOpened { showComments = false; hingeOpened = false }
             }

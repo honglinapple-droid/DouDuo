@@ -235,6 +235,9 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
                                                    "install": String(Self.installTime),
                                                    "pull": refreshIndex <= 2 ? "0" : "2"])
         let p = try JSONDecoder().decode(DYFeedPage.self, from: d)
+        #if DEBUG
+        DYLiveModel.log("DDFEED refresh=\(refreshIndex) http=\(p.status) items=\(p.items.count) playable=\(p.items.filter { $0.play != nil || !$0.images.isEmpty }.count) more=\(p.hasMore) msg=\(p.msg ?? "-")")
+        #endif
         guard p.status == 200 else { throw DYError.blocked("HTTP \(p.status)") }
         if p.items.isEmpty, let m = p.msg, !m.isEmpty { throw DYError.blocked(m) }
         return (p.items, p.hasMore)
@@ -775,8 +778,14 @@ final class DYFeedModel: ObservableObject {
             if added == 0 && !raw.isEmpty {
                 // 兜底：过滤后一条不剩（看过的太多 / 横屏太多）就放原始页，列表不能干
                 added += absorb(raw, hasMore: true, prefiltered: portraitMode == 0)
+                // b50：竖屏优先下这一步仍可能一条不剩（没登录时接口不给视频宽高，全被当成横屏）→ 页面空着、只剩「暂时没刷到推荐」。
+                // 真兜底：还是 0 就不挑横竖，原样放进来（和作者原版没登录也能刷一致）
+                if added == 0 { added += absorb(raw, hasMore: true, prefiltered: true) }
             }
             hasMore = true
+            #if DEBUG
+            DYLiveModel.log("DDLOAD local raw=\(raw.count) added=\(added) items=\(items.count) err=\(error ?? "-") mode=\(portraitMode)")
+            #endif
             if items.isEmpty && added == 0 && error == nil { error = "暂时没刷到推荐，登录后或稍后再试" }
             DYRecommender.shared.refillPool(bridge, loggedIn: isLoggedIn || !followed.isEmpty)
             return
@@ -898,7 +907,7 @@ struct DouyinFeedScreen: View {
                     DYSideComments(bridge: bridge, aweme: cur, width: geo.dyPanelWidth(hinge: hinge, commentsOpen: showComments),
                                    open: $showComments, onClosed: { hingeOpenedComments = false })
                         .id(cur.id)
-                        .transition(.move(edge: .trailing))
+                        .transition(.move(edge: .trailing).combined(with: .opacity))
                 }
             }
             // b49：姿态停稳 0.4 秒才换布局；半折叠时评论区和新宽度在同一个动画里一次出来，展平 / 合上时把自动打开的收回
@@ -941,6 +950,8 @@ struct DouyinFeedScreen: View {
             // 消息用自己的后台网页，不占签名页；晚 6 秒起，先让第一条视频起来（冷启动黑屏久）
             Task { try? await Task.sleep(nanoseconds: 6_000_000_000); im.start() }
             #if DEBUG
+            // 自测时确认模拟器没登着真账号（日志里看 DDSESSION）
+            Task { for t in [3, 15] { try? await Task.sleep(nanoseconds: UInt64(t) * 1_000_000_000); DYLiveModel.log("DDSESSION t=\(t)s loggedIn=\(await DYSession.loggedIn())") } }
             if ProcessInfo.processInfo.environment["DOUDUO_SELFTEST"] == "1" { Task { await DDSelfTest.run(bridge) } }
             if ProcessInfo.processInfo.environment["DOUDUO_APITEST"] == "1" { Task { await DDApiProbe.run(bridge) } }
             #endif
@@ -1016,6 +1027,10 @@ struct DouyinFeedScreen: View {
             focusCurrent()
             saveSession()
             reportWatch(old: old, new: new)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .dyFollowChanged)) { n in
+            guard let sec = n.userInfo?["sec"] as? String, let on = n.userInfo?["on"] as? Bool else { return }
+            if on { feed.followed.insert(sec) } else { feed.followed.remove(sec) }
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
             saveSession(now: true)
@@ -1283,8 +1298,8 @@ struct DouyinFeedScreen: View {
                          onLogin: { showMine = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { web = DYWebTarget(url: DouyinWeb.home) } },
                          onAuthor: { a in authorTarget = a.author })
         }
-
-
+        // b50：私信模型放进环境，搜索 / 我的 / 作者主页 / 聊天里点开的视频，转发都走「发给朋友」
+        .environment(\.dyIM, im)
     }
 
     /// 顶部一排：左菜单，中间 关注/推荐/直播，右边 搜索 / 我的
@@ -1367,6 +1382,7 @@ struct DouyinFeedScreen: View {
                 .padding()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
+                ScrollViewReader { proxy in
                 ScrollView(.vertical) {
                     LazyVStack(spacing: 0) {
                         ForEach(feed.items) { item in
@@ -1400,7 +1416,14 @@ struct DouyinFeedScreen: View {
                 .refreshable { await refreshRecommendations() }
                 .scrollTargetBehavior(.paging)
                 .scrollPosition(id: $scrollID, anchor: .center)
-                .onAppear { scrollID = currentID }
+                .onAppear {
+                    scrollID = currentID
+                    // b50：从直播 / 关注切回推荐时这个列表是新建的，内屏（宽屏）第一帧会停在上一条——画面是上一条且不动，声音和进度却是当前条。
+                    // 等布局稳了再按 id 滚到当前条（两次：下一帧 + 0.2 秒后）
+                    let id = currentID
+                    DispatchQueue.main.async { if let id, id == currentID { proxy.scrollTo(id, anchor: .center) } }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { if let id, id == currentID, !userScrolling { proxy.scrollTo(id, anchor: .center) } }
+                }
                 .simultaneousGesture(DragGesture(minimumDistance: 8)
                     .onChanged { value in
                         if abs(value.translation.height) > abs(value.translation.width) {
@@ -1428,6 +1451,7 @@ struct DouyinFeedScreen: View {
                 }
                 .scrollIndicators(.hidden)
                 .ignoresSafeArea()
+                }
             }
         }
     }
@@ -1441,7 +1465,9 @@ struct DouyinFeedScreen: View {
         Task {
             do {
                 switch try await bridge.follow(sec, follow: true) {
-                case .ok: showToast("已关注 \(author.name)")
+                case .ok:
+                    DYFollowState.shared.set(sec, true)   // 作者主页也显示「已关注」
+                    showToast("已关注 \(author.name)")
                 case .notLoggedIn:
                     feed.followed.remove(sec)
                     showToast("抖音未登录：菜单 → 网页版 / 登录")
@@ -2363,7 +2389,9 @@ struct DYCommentPanel: View {
         GeometryReader { g in
             panelBody
                 .offset(x: dragX)
-                .simultaneousGesture(DragGesture(minimumDistance: 14)
+                // b50：位移按「整个屏幕」量（.global）。b49 按面板自己量，面板跟着手指移动 → 量出来的位移跟着变 →
+                // 来回打架：一直闪、抖、虚影，拖到一半卡住关不掉。
+                .simultaneousGesture(DragGesture(minimumDistance: 14, coordinateSpace: .global)
                     .onChanged { v in
                         if axis == 0 {
                             let dx = abs(v.translation.width), dy = abs(v.translation.height)
@@ -2378,8 +2406,9 @@ struct DYCommentPanel: View {
                         axis = 0
                         guard wasH else { return }
                         let w = max(g.size.width, 1)
-                        let fast = v.predictedEndTranslation.width - v.translation.width > 160
-                        let close = v.translation.width > w * 0.35 || (v.translation.width > 40 && fast) || v.translation.width < -80
+                        // b50：滑一点就能关——过面板宽 25%，或松手时按速度预测能滑过一半，就收起
+                        let t = v.translation.width
+                        let close = t > w * 0.25 || (t > 20 && v.predictedEndTranslation.width > w * 0.5) || t < -80
                         if let onDragEnd { onDragEnd(close); return }
                         if close {
                             onClose?()
@@ -2548,15 +2577,18 @@ struct DYCommentPanel: View {
                 }
                 .buttonStyle(.plain)
             } else if replies[c.id] == nil || (replyMore[c.id] ?? false) {
-                Button { Task { await loadReplies(c) } } label: {
-                    HStack(spacing: 6) {
-                        Rectangle().fill(Color.secondary.opacity(0.5)).frame(width: 18, height: 1)
-                        Text(replies[c.id] == nil ? "展开 \(c.replies) 条回复" : "展开更多回复")
-                        if replyLoading.contains(c.id) { ProgressView().controlSize(.mini) }
-                    }
-                    .font(.caption.weight(.medium)).foregroundStyle(.themeTextSecondary)
+                // b50：原来是 Button——手指按在这行上横拖关评论区，松手时只要还在按钮范围内就算「点了」→ 回复被展开。
+                // 改成点按手势：手指一移动就不算点。
+                HStack(spacing: 6) {
+                    Rectangle().fill(Color.secondary.opacity(0.5)).frame(width: 18, height: 1)
+                    Text(replies[c.id] == nil ? "展开 \(c.replies) 条回复" : "展开更多回复")
+                    if replyLoading.contains(c.id) { ProgressView().controlSize(.mini) }
                 }
-                .buttonStyle(.plain)
+                .font(.caption.weight(.medium)).foregroundStyle(.themeTextSecondary)
+                .padding(.vertical, 4)
+                .contentShape(Rectangle())
+                .onTapGesture { Task { await loadReplies(c) } }
+                .accessibilityAddTraits(.isButton)
                 .accessibilityIdentifier("douyin.replies")
             }
         }
@@ -2617,14 +2649,22 @@ struct DYSideComments: View {
     @State private var drag: CGFloat = 0
 
     var body: some View {
-        DYCommentPanel(bridge: bridge, aweme: aweme, onClose: { close() },
-                       onDrag: { drag = min($0, width) },
-                       onDragEnd: { c in
-                           if c { close() } else { withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { drag = 0 } }
-                       })
-            .frame(width: width)
-            .frame(width: max(0, width - drag), alignment: .leading)
-            .clipped()
+        // b50：评论栏铺到屏幕最底下。原来底部 Home 条那一截（约 34pt）被裁掉，露出一条黑边；
+        // 现在整栏延伸到底，输入框仍然留在 Home 条上面，下面那一截用同样的磨砂底补上。
+        GeometryReader { g in
+            let inset = g.safeAreaInsets.bottom
+            DYCommentPanel(bridge: bridge, aweme: aweme, onClose: { close() },
+                           onDrag: { drag = min($0, width) },
+                           onDragEnd: { c in
+                               if c { close() } else { withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { drag = 0 } }
+                           })
+                .padding(.bottom, inset)
+                .background(alignment: .bottom) { Rectangle().fill(.regularMaterial).frame(height: inset) }
+                .frame(width: width, height: g.size.height)
+        }
+        .frame(width: max(0, width - drag), alignment: .leading)
+        .clipped()
+        .ignoresSafeArea(.container, edges: .bottom)
     }
 
     private func close() {
