@@ -817,6 +817,10 @@ struct DYFollowSwipeBack: ViewModifier {
     @State private var dx: CGFloat = 0
     @State private var axis = 0          // 0 未定 / 1 横（返回）/ 2 其他
     @State private var width: CGFloat = 400
+    /// b53：认定是「右滑返回」后锁住页面里的按钮——手势和按钮是同时生效的，整行宽的会话行在手指下面，
+    /// 松手就会被当成点了一下（用户：快速滑两下会点进别人的聊天再退出来）。松手 0.35 秒后解锁
+    @State private var locked = false
+    @State private var unlockTask: DispatchWorkItem?
 
     private var drag: some Gesture {
         DragGesture(minimumDistance: edgeOnly ? 8 : 16, coordinateSpace: .global)
@@ -826,12 +830,17 @@ struct DYFollowSwipeBack: ViewModifier {
                     axis = (fromEdge && v.translation.width > 0 && v.translation.width > abs(v.translation.height) * 2) ? 1 : 2
                 }
                 guard axis == 1 else { return }
+                if !locked { unlockTask?.cancel(); locked = true }
                 dx = max(0, v.translation.width)
             }
             .onEnded { v in
                 let was = axis == 1
                 axis = 0
                 guard was else { return }
+                unlockTask?.cancel()
+                let u = DispatchWorkItem { locked = false }
+                unlockTask = u
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: u)
                 let t = v.translation.width
                 if t > width * 0.3 || (t > 30 && v.predictedEndTranslation.width > width * 0.5) {
                     withAnimation(.easeOut(duration: 0.22)) { dx = width + 30 } completion: {
@@ -847,6 +856,7 @@ struct DYFollowSwipeBack: ViewModifier {
 
     func body(content: Content) -> some View {
         content
+            .disabled(locked)
             .background(Color.black.ignoresSafeArea())
             .offset(x: dx)
             .shadow(color: .black.opacity(dx > 0 ? 0.45 : 0), radius: 14, x: -6)
@@ -878,9 +888,21 @@ struct DYMessagesScreen: View {
     @State private var query = ""
     @State private var open: DYIMConversation?
 
+    #if DEBUG
+    /// 模拟器自测：DOUDUO_FAKEIM=1 → 不登录也给 12 个假会话，用来测右滑误触（只在调试版）
+    private static let fakeRows: [DYIMConversation]? = ProcessInfo.processInfo.environment["DOUDUO_FAKEIM"] == "1"
+        ? (0..<12).map { DYIMConversation(index: $0, name: "测试联系人\($0)", last: "假消息", time: "", pinned: false, avatar: nil, unread: 0) } : nil
+    #endif
+    private var all: [DYIMConversation] {
+        #if DEBUG
+        if let f = Self.fakeRows { return f }
+        #endif
+        return im.conversations
+    }
+
     private var rows: [DYIMConversation] {
         let q = query.trimmingCharacters(in: .whitespaces)
-        return q.isEmpty ? im.conversations : im.conversations.filter { $0.name.localizedCaseInsensitiveContains(q) || $0.last.localizedCaseInsensitiveContains(q) }
+        return q.isEmpty ? all : all.filter { $0.name.localizedCaseInsensitiveContains(q) || $0.last.localizedCaseInsensitiveContains(q) }
     }
 
     var body: some View {
@@ -908,13 +930,13 @@ struct DYMessagesScreen: View {
                 .background(RoundedRectangle(cornerRadius: 10).fill(.white.opacity(0.08)))
                 .padding(.horizontal, 16).padding(.bottom, 8)
 
-                if !im.loggedIn && im.conversations.isEmpty {
+                if !im.loggedIn && all.isEmpty {
                     VStack(spacing: 12) {
                         Text("还没登录抖音").foregroundStyle(.white)
                         Button("去登录") { onLogin() }.buttonStyle(.borderedProminent).tint(dyRed)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if im.conversations.isEmpty {
+                } else if all.isEmpty {
                     VStack(spacing: 10) {
                         ProgressView().tint(.white)
                         Text(im.error ?? "正在读取消息…").font(.footnote).foregroundStyle(.white.opacity(0.6))
@@ -924,7 +946,12 @@ struct DYMessagesScreen: View {
                     ScrollView {
                         LazyVStack(spacing: 0) {
                             ForEach(rows) { c in
-                                Button { open = c } label: { row(c) }
+                                Button {
+                                    #if DEBUG
+                                    DYLiveModel.log("DDTAP open \(c.name)")
+                                    #endif
+                                    open = c
+                                } label: { row(c) }
                                     .buttonStyle(.plain)
                                     .accessibilityIdentifier("douyin.im.item")
                             }
