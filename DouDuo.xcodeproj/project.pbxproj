@@ -24,6 +24,7 @@
 		B6C12A97D054814FFFCCE8A0 /* DouyinVideoCache.swift in Sources */ = {isa = PBXBuildFile; fileRef = 008B7FB68E974359DCF77E02 /* DouyinVideoCache.swift */; };
 		D3DE2156FEFF721744FDB55E /* Theme.swift in Sources */ = {isa = PBXBuildFile; fileRef = E8C00A82D0DF6727AA1E57D1 /* Theme.swift */; };
 		E032F5638D208636EDA0B53A /* DouyinEmoji.swift in Sources */ = {isa = PBXBuildFile; fileRef = 390316DDF22206E0F3AF51D0 /* DouyinEmoji.swift */; };
+		F1C734494A6285D55461A5E2 /* DouyinImagePost.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBCB0355D12BF71F319C1FB8 /* DouyinImagePost.swift */; };
 		FBD2D9957CE6E54F78D0B1FD /* DouyinLiveChat.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4A3202317C2541C9EFEC8DBF /* DouyinLiveChat.swift */; };
 /* End PBXBuildFile section */
 
@@ -59,6 +60,7 @@
 		DB5BA2B64FF7BC3DADD473D2 /* DouyinGlassHinge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DouyinGlassHinge.swift; sourceTree = "<group>"; };
 		E4676F979699E4167CA26B2E /* DouyinIM.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DouyinIM.swift; sourceTree = "<group>"; };
 		E8C00A82D0DF6727AA1E57D1 /* Theme.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Theme.swift; sourceTree = "<group>"; };
+		FBCB0355D12BF71F319C1FB8 /* DouyinImagePost.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DouyinImagePost.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -84,6 +86,7 @@
 				79D68085CA0B47F08B3A1535 /* DouyinFeedView.swift */,
 				DB5BA2B64FF7BC3DADD473D2 /* DouyinGlassHinge.swift */,
 				E4676F979699E4167CA26B2E /* DouyinIM.swift */,
+				FBCB0355D12BF71F319C1FB8 /* DouyinImagePost.swift */,
 				4A3202317C2541C9EFEC8DBF /* DouyinLiveChat.swift */,
 				3A4F19464C49C708DEA115B3 /* DouyinRecommend.swift */,
 				008B7FB68E974359DCF77E02 /* DouyinVideoCache.swift */,
@@ -246,6 +249,7 @@
 				64760847CD94FEE469039F33 /* DouyinFeedView.swift in Sources */,
 				5001B2E42DCB7851A4D4F608 /* DouyinGlassHinge.swift in Sources */,
 				0EE9C04AABA2C74BD994CAFF /* DouyinIM.swift in Sources */,
+				F1C734494A6285D55461A5E2 /* DouyinImagePost.swift in Sources */,
 				FBD2D9957CE6E54F78D0B1FD /* DouyinLiveChat.swift in Sources */,
 				734B49EB37B08DD671FE4429 /* DouyinRecommend.swift in Sources */,
 				B6C12A97D054814FFFCCE8A0 /* DouyinVideoCache.swift in Sources */,
@@ -375,7 +379,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 53;
+				CURRENT_PROJECT_VERSION = 54;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
 				DEVELOPMENT_TEAM = "";
 				ENABLE_NS_ASSERTIONS = NO;
@@ -451,7 +455,7 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
-				CURRENT_PROJECT_VERSION = 53;
+				CURRENT_PROJECT_VERSION = 54;
 				DEBUG_INFORMATION_FORMAT = dwarf;
 				DEVELOPMENT_TEAM = "";
 				ENABLE_STRICT_OBJC_MSGSEND = YES;

@@ -1,5 +1,6 @@
 // 本地视频缓存：推荐流播放时，后台把后面几条完整下载到 Caches/dd-videos/（磁盘上最多留 N 条，默认 50）。
 // b44：同时只下 1 条、只下当前后面 5 条以内——之前 2 条并发一路下到 50 条，和正在播的视频、推荐接口抢网络
+// b54：超过 15MB 的不整条下（先探大小），大视频在线播放、靠预加载器缓冲开头
 // - 下滑到已缓存的条目直接播本地文件，不等网络
 // - 下次打开 App 先播「已缓存、还没看过」的，连接抖音放到后台
 // - 超过上限先删看过的、再删最早的
@@ -138,10 +139,32 @@ actor DYVideoCache {
         }
     }
 
+    /// b54：超过这么大的不整条下载（之前有一条 98MB 下了 51 秒，抢正在看的那条的网速、还常断）。
+    /// 大视频交给播放器在线播放：预加载器已经提前把开头几秒缓冲在内存里，照样秒开
+    static let maxBytesPerVideo = 15 * 1024 * 1024
+
+    /// 先只要 2 个字节，从回包的 Content-Range 读出整条多大；读不出来返回 nil（照旧下载）
+    private func probeSize(_ u: URL) async -> Int? {
+        var r = URLRequest(url: u)
+        DYMedia.headers.forEach { r.setValue($1, forHTTPHeaderField: $0) }
+        r.setValue("bytes=0-1", forHTTPHeaderField: "Range")
+        r.timeoutInterval = 8
+        guard let (_, resp) = try? await session.data(for: r), let h = resp as? HTTPURLResponse else { return nil }
+        if let cr = h.value(forHTTPHeaderField: "Content-Range"), let total = cr.split(separator: "/").last.flatMap({ Int($0) }) { return total }
+        return h.statusCode == 200 && h.expectedContentLength > 0 ? Int(h.expectedContentLength) : nil
+    }
+
     private func download(_ a: DYAweme, _ u: URL) async {
         var r = URLRequest(url: u)
         DYMedia.headers.forEach { r.setValue($1, forHTTPHeaderField: $0) }
         let t0 = Date()
+        if let size = await probeSize(u), size > Self.maxBytesPerVideo {
+            failed.insert(a.id)   // 记下来，这条不再排队
+            DYLiveModel.log("DDCACHE skip 太大 \(a.id) \(size / 1024 / 1024)MB → 在线播放")
+            active.remove(a.id)
+            pump()
+            return
+        }
         do {
             let (tmp, resp) = try await session.download(for: r)
             if let h = resp as? HTTPURLResponse, h.statusCode >= 400 { throw URLError(.badServerResponse) }

@@ -36,6 +36,20 @@ struct DYIMMessage: Identifiable, Equatable, Codable {
     /// 表情回复：谁用哪个表情回了这条
     var reactions: [Reaction]? = nil
     struct Reaction: Equatable, Codable { let img: String; let name: String }
+    /// b54：网页里这条消息自己的编号（有就用它拼接聊天记录，没有就按内容对齐）
+    var mid: String? = nil
+    /// b54：转发的评论：评论编号、（回复里的评论）所回复的那条评论编号
+    var cmtId: String? = nil
+    var replyTo: String? = nil
+
+    func with(box b: Int) -> DYIMMessage { var m = DYIMMessage(id: id, box: b, kind: kind, fromMe: fromMe, text: text, author: author, cover: cover, avatar: avatar, itemId: itemId, sender: sender, reactions: reactions); m.mid = mid; m.cmtId = cmtId; m.replyTo = replyTo; return m }
+    func with(id i: Int) -> DYIMMessage { var m = DYIMMessage(id: i, box: box, kind: kind, fromMe: fromMe, text: text, author: author, cover: cover, avatar: avatar, itemId: itemId, sender: sender, reactions: reactions); m.mid = mid; m.cmtId = cmtId; m.replyTo = replyTo; return m }
+    /// 对齐用的内容键：有编号用编号；时间分隔条只认「是时间条」（文字会从「10:23」变「昨天 10:23」）
+    var alignKey: String {
+        if let mid, !mid.isEmpty { return "#" + mid }
+        if kind == .time { return "time" }
+        return "\(kind.rawValue)|\(fromMe)|\(text)|\(itemId ?? "")|\(cmtId ?? "")"
+    }
 }
 
 struct DYIMBanner: Identifiable, Equatable {
@@ -124,7 +138,8 @@ private enum DYIMJS {
     if (!list) return JSON.stringify({ title: '', msgs: [] });
     // 网页列表是倒着排的（最新在最上、data-index 0），这里按 data-index 从大到小 = 从旧到新
     const boxes = boxesNewestFirst().map(b => ({ b, i: idxOf(b) })).sort((x, y) => y.i - x.i).map(x => x.b);
-    const flat = [];
+    const flat = [], probes = [];
+    let keyLog = '';
     boxes.forEach((b, k) => {
       const i = idxOf(b) >= 0 ? idxOf(b) : k;
       const pm = msgOf(b); const pc = (pm && pm.parsedContent) || {};
@@ -137,7 +152,9 @@ private enum DYIMJS {
       const cs = b.querySelector('.MessageItemCommentSharecontainer');
       const av = b.querySelector('.commonIMAvataravatarContainer img');
       const pick = el => { const im = el && (el.querySelector('img.commonMyImageimgReal') || el.querySelector('img')); return im ? (im.currentSrc || im.src || '') : ''; };
-      let kind = 'other', text = '', author = '', cover = '';
+      let kind = 'other', text = '', author = '', cover = '', cmtId = '', replyTo = '';
+      // b54：消息自己的编号（拼接聊天记录用；字段名几种写法都试，拿不到为空）
+      const mid = pm ? String(pm.serverId || pm.server_id || pm.serverMessageId || pm.msgId || pm.messageId || pm.clientMessageId || pm.id || '') : '';
       let itemId = pc.itemId ? String(pc.itemId) : '';
       const mtype = pm ? (pm.type || pm.msgType || pm.messageType || 0) : 0;
       const coverOf = o => (o && o.url_list && o.url_list[0]) || '';
@@ -147,7 +164,22 @@ private enum DYIMJS {
       else if (mtype === 17 || au) { kind = 'audio'; text = (au && txt(au.querySelector('.MessageItemAudioduration'))) || (pc.duration ? Math.round(pc.duration / 1000) + '"' : '') || '语音'; }
       else if (t) { kind = 'text'; text = t.innerText; }
       else if (vid) { kind = 'video'; cover = pick(vid); text = '视频'; }
-      else if (cs) { kind = 'comment'; text = txt(cs).slice(0, 200); }
+      else if (cs || pc.comment_id || pc.commentId || pc.cid) {
+        // b54：转发的评论。字段名没有样本，几种常见写法都试；拿不到就退回整块文字
+        kind = 'comment';
+        const cu = pc.comment_user || pc.commentUser || pc.user || {};
+        cmtId = String(pc.comment_id || pc.commentId || pc.cid || '');
+        replyTo = String(pc.reply_id || pc.replyId || pc.reply_comment_id || pc.root_comment_id || pc.rootCommentId || '');
+        if (!itemId) itemId = String(pc.item_id || pc.aweme_id || pc.awemeId || pc.itemId || pc.group_id || '');
+        if (itemId === '0' || itemId === 'undefined') itemId = '';
+        author = String(pc.comment_user_name || pc.commentUserName || cu.nickname || cu.nick_name || pc.user_name || pc.nickname || '').slice(0, 30);
+        text = String(pc.comment_text || pc.commentText || pc.comment_content || pc.content_text || pc.comment || pc.text || '').slice(0, 300);
+        cover = coverOf(pc.cover_url) || coverOf(pc.content_thumb) || coverOf(pc.cover) || coverOf(pc.video_cover) || (cs && pick(cs)) || '';
+        if (!text) text = (cs ? txt(cs) : '').slice(0, 300);
+        if (!text) text = '[评论]';
+        // 诊断：把这类消息的原始数据带回去写日志（只记在手机本地），对上字段名
+        probes.push('mtype=' + mtype + ' keys=' + (pm ? Object.keys(pm).slice(0, 30).join(',') : '-') + ' pc=' + JSON.stringify(pc).slice(0, 700) + ' dom=' + (cs ? (cs.innerHTML || '').replace(/\s+/g, ' ').slice(0, 500) : '-'));
+      }
       else if (/暂不支持/.test(b.innerText)) { kind = 'unsupported'; text = '暂不支持的消息类型，请到抖音手机端查看'; }
       else { const raw = txt(b).replace(/^已读\s*/, ''); if (raw && !time) text = raw.slice(0, 200); }
       // 群聊：发言人名在气泡上方的 titleWrapper 里
@@ -157,9 +189,10 @@ private enum DYIMJS {
       const tt = time ? txt(time) : '';
       const key = 100000 - i;   // 让 id 随时间递增
       if (tt) flat.push({ id: key * 2, box: i, kind: 'time', fromMe: false, text: tt, author: '', cover: '', avatar: '', itemId: '', sender: '', reactions: [] });
-      if (text || cover) flat.push({ id: key * 2 + 1, box: i, kind, fromMe, text, author, cover, avatar: av ? (av.currentSrc || av.src || '') : '', itemId, sender, reactions });
+      if (!keyLog && pm) keyLog = Object.keys(pm).slice(0, 40).join(',');
+      if (text || cover) flat.push({ id: key * 2 + 1, box: i, kind, fromMe, text, author, cover, avatar: av ? (av.currentSrc || av.src || '') : '', itemId, sender, reactions, mid, cmtId, replyTo });
     });
-    return JSON.stringify({ title: txt(document.querySelector('.StackLayoutStackChatHeadertitle')), msgs: flat });
+    return JSON.stringify({ title: txt(document.querySelector('.StackLayoutStackChatHeadertitle')), msgs: flat, probes, keyLog });
     """#
 
     /// 发送：填字 → 点右下角发送钮（网页就是这么发的）→ 不行再回车
@@ -267,12 +300,22 @@ private enum DYIMJS {
     const list = document.querySelector('.messageMessageListlist');
     if (!list) return JSON.stringify({ ok: false });
     const n0 = boxesNewestFirst().length;
+    const maxIdx = () => Math.max(-1, ...boxesNewestFirst().map(idxOf));
+    const m0 = maxIdx(), s0 = list.scrollTop;
     list.scrollTop = list.scrollTop - 2500; list.dispatchEvent(new Event('scroll', { bubbles: true }));
-    for (let i = 0; i < 12; i++) { await sleep(150); if (boxesNewestFirst().length > n0) break; }
+    for (let i = 0; i < 12; i++) { await sleep(150); if (maxIdx() > m0) break; }
     await sleep(300);
-    return JSON.stringify({ ok: true, n: boxesNewestFirst().length, grew: boxesNewestFirst().length > n0 });
+    // b54：滚不动了（scrollTop 没变）且没出现更早的消息 = 网页这边也到顶了
+    return JSON.stringify({ ok: true, n: boxesNewestFirst().length, grew: maxIdx() > m0, atTop: Math.abs(list.scrollTop - s0) < 2 && maxIdx() <= m0 });
     """#
 
+
+    /// b54：把网页聊天列表滚回最底下（最新消息那头），新消息才会继续出现在网页里
+    static let scrollBottom = helpers + #"""
+    const list = document.querySelector('.messageMessageListlist');
+    if (list) { list.scrollTop = 0; list.dispatchEvent(new Event('scroll', { bubbles: true })); }
+    return JSON.stringify({ ok: !!list });
+    """#
 
     /// 把一个视频以卡片形式分享给朋友。前提：后台网页已经**整页跳到** /jingxuan?modal_id=视频号
     ///（b38 用"改地址 + 假 popstate"在刚加载的页面上抖音根本不响应，每次都报没打开；真加载 3 秒弹窗就开）。
@@ -482,11 +525,26 @@ private enum DYIMCache {
         get { (UserDefaults.standard.data(forKey: listKey)).flatMap { try? JSONDecoder().decode([DYIMConversation].self, from: $0) } ?? [] }
         set { UserDefaults.standard.set(try? JSONEncoder().encode(newValue), forKey: listKey) }
     }
+    /// b54：完整聊天记录存成文件（Application Support/dd-im/），往上翻拼出来的都留着，下次打开直接能往上翻；最多留 3000 条
+    private static let dir: URL = {
+        let d = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("dd-im", isDirectory: true)
+        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
+        return d
+    }()
+    private static func file(_ name: String) -> URL {
+        let safe = Data(name.utf8).base64EncodedString().replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "+", with: "-")
+        return dir.appendingPathComponent("chat-\(safe.prefix(120)).json")
+    }
     static func chat(_ name: String) -> [DYIMMessage] {
-        (UserDefaults.standard.data(forKey: chatKey(name))).flatMap { try? JSONDecoder().decode([DYIMMessage].self, from: $0) } ?? []
+        if let d = try? Data(contentsOf: file(name)), let list = try? JSONDecoder().decode([DYIMMessage].self, from: d) { return list }
+        // 老版本存在 UserDefaults 里的最近 80 条
+        return (UserDefaults.standard.data(forKey: chatKey(name))).flatMap { try? JSONDecoder().decode([DYIMMessage].self, from: $0) } ?? []
     }
     static func save(_ name: String, _ msgs: [DYIMMessage]) {
-        UserDefaults.standard.set(try? JSONEncoder().encode(Array(msgs.suffix(80))), forKey: chatKey(name))
+        let keep = Array(msgs.suffix(3000))
+        DispatchQueue.global(qos: .utility).async {
+            if let d = try? JSONEncoder().encode(keep) { try? d.write(to: file(name), options: .atomic) }
+        }
     }
 }
 
@@ -503,6 +561,8 @@ final class DYIMModel: ObservableObject {
     @Published var error: String?
     @Published var banner: DYIMBanner?
     @Published var unreadTotal = 0
+    /// b54：聊天记录每读一次 +1（打开有未读的聊天时，等真正读到网页数据再定位到第一条未读）
+    @Published var msgTick = 0
     @Published var pendingOpen: String?
     /// 我自己的头像（从我发的消息里取）
     @Published var myAvatar: String?
@@ -523,8 +583,8 @@ final class DYIMModel: ObservableObject {
 
     private struct ListResp: Decodable { let login: Bool; let list: [Row]
         struct Row: Decodable { let index: Int; let name: String; let last: String; let time: String; let pinned: Bool; let avatar: String; let unread: Int } }
-    private struct MsgResp: Decodable { let title: String; let msgs: [Row]
-        struct Row: Decodable { let id: Int; let box: Int; let kind: String; let fromMe: Bool; let text: String; let author: String; let cover: String; let avatar: String; let itemId: String?; let sender: String?; let reactions: [DYIMMessage.Reaction]? } }
+    private struct MsgResp: Decodable { let title: String; let msgs: [Row]; let probes: [String]?; let keyLog: String?
+        struct Row: Decodable { let id: Int; let box: Int; let kind: String; let fromMe: Bool; let text: String; let author: String; let cover: String; let avatar: String; let itemId: String?; let sender: String?; let reactions: [DYIMMessage.Reaction]?; let mid: String?; let cmtId: String?; let replyTo: String? } }
     private struct OKResp: Decodable { let ok: Bool; let login: Bool?; let title: String?; let why: String?; let id: String? }
 
     func attach(_ b: DouyinBridge) { bridge = b }
@@ -533,6 +593,10 @@ final class DYIMModel: ObservableObject {
     func start() {
         guard !started else { return }
         started = true
+        #if DEBUG
+        // 模拟器自测：DOUDUO_FAKEUNREAD=数字 → 不登录也显示未读气泡
+        if let n = ProcessInfo.processInfo.environment["DOUDUO_FAKEUNREAD"].flatMap(Int.init) { unreadTotal = n }
+        #endif
         web.load()
         startListPolling()
     }
@@ -593,8 +657,8 @@ final class DYIMModel: ObservableObject {
                 if listVisible && conversations.isEmpty { listLoading = true }
                 await refreshList()
                 listLoading = false
-                // 列表页开着 3 秒一刷；聊天页开着 8 秒；都没开 15 秒（够弹横幅，又不拖慢视频）
-                let gap: UInt64 = listVisible ? 3 : (chatVisible ? 8 : 30)
+                // 列表页开着 3 秒一刷；聊天页开着 8 秒；都没开 15 秒（主页「消息」上的未读气泡要及时，又不拖慢视频）
+                let gap: UInt64 = listVisible ? 3 : (chatVisible ? 8 : 15)
                 try? await Task.sleep(nanoseconds: gap * 1_000_000_000)
             }
         }
@@ -612,7 +676,7 @@ final class DYIMModel: ObservableObject {
 
     func open(_ c: DYIMConversation) {
         openName = c.name
-        messages = DYIMCache.chat(c.name)      // 先把上次的记录亮出来
+        messages = DYIMCache.chat(c.name).map { $0.with(box: -1) }      // 先把上次的记录亮出来（网页位置还没对上，先记成 -1）
         chatLoading = messages.isEmpty
         chatTask?.cancel()
         chatTask = Task {
@@ -629,7 +693,11 @@ final class DYIMModel: ObservableObject {
         }
     }
 
-    func closeChat() { chatTask?.cancel(); openName = nil; chatVisible = false }
+    func closeChat() {
+        chatTask?.cancel(); openName = nil; chatVisible = false
+        scrollBackTask?.cancel()
+        Task { _ = try? await web.eval(DYIMJS.scrollBottom, as: OKResp.self) }
+    }
 
     func refreshMessages() async {
         guard !sharing else { return }
@@ -638,34 +706,99 @@ final class DYIMModel: ObservableObject {
             // 群聊的网页标题带人数后缀「沪上抖音分情(7)」，去掉再比（b47 之前这里不相等就整页不更新 → 群聊全空）
             let shown = r.title.replacingOccurrences(of: #"\(\d+\)\s*$"#, with: "", options: .regularExpression).trimmingCharacters(in: .whitespaces)
             guard let name = openName, r.title.isEmpty || shown == name || r.title == name else { return }
-            let fresh = r.msgs.map { DYIMMessage(id: $0.id, box: $0.box, kind: DYIMMessage.Kind(rawValue: $0.kind) ?? .other, fromMe: $0.fromMe, text: $0.text,
-                                                 author: $0.author.isEmpty ? nil : $0.author, cover: $0.cover.isEmpty ? nil : $0.cover, avatar: $0.avatar.isEmpty ? nil : $0.avatar,
-                                                 itemId: ($0.itemId ?? "").isEmpty ? nil : $0.itemId,
-                                                 sender: ($0.sender ?? "").isEmpty ? nil : $0.sender,
-                                                 reactions: ($0.reactions ?? []).isEmpty ? nil : $0.reactions) }
+            let fresh = r.msgs.map { x -> DYIMMessage in
+                var m = DYIMMessage(id: x.id, box: x.box, kind: DYIMMessage.Kind(rawValue: x.kind) ?? .other, fromMe: x.fromMe, text: x.text,
+                                    author: x.author.isEmpty ? nil : x.author, cover: x.cover.isEmpty ? nil : x.cover, avatar: x.avatar.isEmpty ? nil : x.avatar,
+                                    itemId: (x.itemId ?? "").isEmpty ? nil : x.itemId,
+                                    sender: (x.sender ?? "").isEmpty ? nil : x.sender,
+                                    reactions: (x.reactions ?? []).isEmpty ? nil : x.reactions)
+                m.mid = (x.mid ?? "").isEmpty ? nil : x.mid
+                m.cmtId = (x.cmtId ?? "").isEmpty ? nil : x.cmtId
+                m.replyTo = (x.replyTo ?? "").isEmpty || x.replyTo == "0" ? nil : x.replyTo
+                return m
+            }
+            // b54 诊断：消息数据长什么样（每次打开 App 记一次）、转发评论的原始数据（每种记一次）。只写手机本地日志
+            if let k = r.keyLog, !k.isEmpty, !Self.loggedKeys { Self.loggedKeys = true; DYLiveModel.log("DDIMKEYS \(k)") }
+            for p in r.probes ?? [] where !Self.loggedProbes.contains(p) {
+                Self.loggedProbes.insert(p)
+                DYLiveModel.log("DDIMCOMMENT \(p)")
+            }
             guard !fresh.isEmpty else { return }
-            let stable = Self.stabilize(fresh)
-            if let mine = stable.last(where: { $0.fromMe && $0.avatar != nil }) { myAvatar = mine.avatar }
-            if stable != messages { messages = stable; DYIMCache.save(name, stable) }
+            let merged = Self.stabilize(Self.merge(messages, fresh))
+            if let mine = merged.last(where: { $0.fromMe && $0.avatar != nil }) { myAvatar = mine.avatar }
+            if merged != messages { messages = merged; DYIMCache.save(name, merged) }
+            msgTick += 1
         } catch { self.error = error.localizedDescription }
     }
+
+    private static var loggedKeys = false
+    private static var loggedProbes: Set<String> = []
 
     /// 消息编号按内容算（同样内容第几次出现也算进去），不随网页里的位置变；否则来一条新消息整列都重建、滚动位置被拉回底部
     private static func stabilize(_ msgs: [DYIMMessage]) -> [DYIMMessage] {
         var seen: [String: Int] = [:]
         return msgs.map { m in
-            let base = "\(m.kind.rawValue)|\(m.fromMe)|\(m.text)|\(m.cover ?? "")|\(m.itemId ?? "")"
+            let base = m.mid.map { "#" + $0 } ?? "\(m.kind.rawValue)|\(m.fromMe)|\(m.text)|\(m.cover ?? "")|\(m.itemId ?? "")"
             let n = seen[base, default: 0]; seen[base] = n + 1
             var h = Hasher(); h.combine(base); h.combine(n)
-            return DYIMMessage(id: h.finalize(), box: m.box, kind: m.kind, fromMe: m.fromMe, text: m.text, author: m.author, cover: m.cover, avatar: m.avatar, itemId: m.itemId, sender: m.sender, reactions: m.reactions)
+            return m.with(id: h.finalize())
         }
     }
 
-    /// 往上拉到顶：让网页渲染更早的消息，再读一遍
-    func loadOlder() async -> Bool {
-        guard let r = try? await web.eval(DYIMJS.loadOlder, as: ActionResp.self), r.ok else { return false }
-        await refreshMessages()
-        return true
+    /// b54：把网页这次读到的一段（w）拼进已有的完整记录（h），只增不减。
+    /// 网页只把屏幕附近几十条放在页面上，往上翻时下面的会被收走 —— 原来「读到什么就整页换成什么」，所以总数不涨、被当成到顶。
+    /// 做法：找 w 在 h 里能对上的位置（重叠部分逐条一致、重叠最多的那个），h 前后多出来的照留，重叠部分用这次读到的（表情回复等会更新）。
+    /// 对不上（比如中间有消息被撤回）就退回原来的做法：用这次读到的整段。不在网页窗口里的旧消息 box 记成 -1（长按菜单要用网页里的位置）
+    static func merge(_ h: [DYIMMessage], _ w: [DYIMMessage]) -> [DYIMMessage] {
+        guard !h.isEmpty else { return w }
+        guard !w.isEmpty else { return h }
+        let hk = h.map(\.alignKey), wk = w.map(\.alignKey)
+        let need = min(3, w.count, h.count)
+        var best: (o: Int, n: Int)? = nil
+        // o = w[0] 在 h 里的位置（可以是负数：w 比 h 更早）
+        for o in stride(from: h.count - 1, through: -(w.count - 1), by: -1) {
+            let lo = max(0, o), hi = min(h.count, o + w.count)
+            let n = hi - lo
+            guard n >= need, n > (best?.n ?? 0) else { continue }
+            var ok = true
+            for i in lo..<hi where hk[i] != wk[i - o] { ok = false; break }
+            if ok { best = (o, n) }
+        }
+        guard let b = best else { return w }
+        let start = min(0, b.o), end = max(h.count, b.o + w.count)
+        var out: [DYIMMessage] = []
+        out.reserveCapacity(end - start)
+        for p in start..<end {
+            let wi = p - b.o
+            if wi >= 0 && wi < w.count { out.append(w[wi]) }
+            else { out.append(h[p].with(box: -1)) }
+        }
+        return out
+    }
+
+    private struct OlderResp: Decodable { let ok: Bool; let grew: Bool?; let atTop: Bool? }
+    private var scrollBackTask: Task<Void, Never>?
+
+    /// 往上拉到顶：让网页渲染更早的消息，读出来拼到记录前面。
+    /// b54：本地记录可能比网页现在显示的还早（上次翻过的都存着）→ 网页要一路往上滚，直到滚出比记录还早的消息（最多 8 下）。
+    /// 返回：记录变多了没有；网页是不是也到顶了
+    func loadOlder() async -> (grew: Bool, atTop: Bool) {
+        scrollBackTask?.cancel()
+        let before = messages.count
+        var atTop = false
+        for _ in 0..<8 {
+            guard openName != nil, let r = try? await web.eval(DYIMJS.loadOlder, as: OlderResp.self), r.ok else { break }
+            await refreshMessages()
+            if messages.count > before { break }
+            if r.atTop == true { atTop = true; break }
+        }
+        // 看完旧的 10 秒内没再往上翻：把网页滚回最新那头，新消息才会继续进来
+        scrollBackTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 10_000_000_000)
+            guard let self, !Task.isCancelled, self.openName != nil else { return }
+            _ = try? await self.web.eval(DYIMJS.scrollBottom, as: OKResp.self)
+        }
+        return (messages.count > before, atTop)
     }
 
 
@@ -750,6 +883,7 @@ final class DYIMModel: ObservableObject {
     /// 点聊天里的视频卡片：消息里直接带着视频 id（从网页的 React 数据读的），取详情交给原生播放器
     func openCard(_ m: DYIMMessage) async -> DYAweme? {
         if let id = m.itemId { return await detail(id) }
+        guard m.box >= 0 else { return nil }   // 不在网页页面上了，点不到
         do {
             let r = try await web.eval(DYIMJS.openCard, ["box": m.box], as: OKResp.self)
             guard r.ok, let id = r.id, !id.isEmpty else { return nil }
@@ -1025,6 +1159,11 @@ struct DYChatScreen: View {
     @State private var forwardMessage: DYIMMessage?
     @State private var loadingOlder = false
     @State private var olderExhausted = false
+    /// b54：连续几次往上翻都没翻出更早的（一次慢了不算到顶，连续 3 次才算）
+    @State private var olderMisses = 0
+    /// b54：打开时有未读 → 定位到第一条未读，上面画「以下为新消息」
+    @State private var unreadAnchor: Int?
+    @State private var anchorDone = false
 
     @FocusState private var focused: Bool
 
@@ -1047,18 +1186,45 @@ struct DYChatScreen: View {
                     LazyVStack(spacing: 10) {
                         // 滑到最上面：让网页把更早的消息渲染出来
                         Color.clear.frame(height: 1).onAppear { loadOlder(proxy) }
-                        if loadingOlder { ProgressView().tint(.white).padding(.vertical, 6) }
+                        if loadingOlder {
+                            HStack(spacing: 6) { ProgressView().tint(.white).scaleEffect(0.8); Text("加载更早的消息…").font(.caption2).foregroundStyle(.white.opacity(0.5)) }
+                                .padding(.vertical, 6)
+                        } else if olderExhausted && !im.messages.isEmpty {
+                            Text("没有更早的消息了").font(.caption2).foregroundStyle(.white.opacity(0.4)).padding(.vertical, 6)
+                        }
                         if im.chatLoading && im.messages.isEmpty { ProgressView().tint(.white).padding(.top, 40) }
-                        ForEach(im.messages) { m in bubble(m).id(m.id) }
+                        ForEach(im.messages) { m in
+                            if m.id == unreadAnchor {
+                                HStack(spacing: 8) {
+                                    Rectangle().fill(.white.opacity(0.15)).frame(height: 0.5)
+                                    Text("以下为新消息").font(.caption2).foregroundStyle(.white.opacity(0.5)).fixedSize()
+                                    Rectangle().fill(.white.opacity(0.15)).frame(height: 0.5)
+                                }
+                                .padding(.vertical, 4)
+                                .id("unread")
+                            }
+                            bubble(m).id(m.id)
+                        }
                         Color.clear.frame(height: 1).id("bottom")
                     }
                     .padding(.horizontal, 12).padding(.top, 8)
                 }
                 .scrollDismissesKeyboard(.interactively)
                 .onTapGesture { focused = false }
-                // 只有最新一条变了才滚到底（往上翻历史时不打扰）
-                .onChange(of: im.messages.last?.id) { _, _ in if !loadingOlder { proxy.scrollTo("bottom", anchor: .bottom) } }
+                // 只有最新一条变了才滚到底（往上翻历史时不打扰；有未读、还没定位好时也不滚，等定位到第一条未读）
+                .onChange(of: im.messages.last?.id) { _, _ in if !loadingOlder && (anchorDone || conversation.unread == 0) { proxy.scrollTo("bottom", anchor: .bottom) } }
                 .onAppear { DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { proxy.scrollTo("bottom", anchor: .bottom) } }
+                // b54：打开有未读的聊天：等网页数据读到后，停在第一条未读（和抖音一样，上面一条「以下为新消息」）
+                .onChange(of: im.msgTick) { _, _ in
+                    guard !anchorDone else { return }
+                    anchorDone = true
+                    let n = conversation.unread
+                    guard n > 0 else { return }
+                    let theirs = im.messages.filter { !$0.fromMe && $0.kind != .time }
+                    guard let first = theirs.suffix(n).first else { return }
+                    unreadAnchor = first.id
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { proxy.scrollTo("unread", anchor: .top) }
+                }
             }
 
             if let ref = im.replyingTo {
@@ -1132,7 +1298,7 @@ struct DYChatScreen: View {
         }
         .fullScreenCover(item: $play) { t in
             DYListPlayer(bridge: bridge, title: t.title, items: t.items, start: t.start,
-                         loadMore: t.more.isEmpty ? nil : { await im.details(Array(t.more.prefix(4))) }, onAuthor: onAuthor)
+                         loadMore: t.more.isEmpty ? nil : { await im.details(Array(t.more.prefix(4))) }, onAuthor: onAuthor, focus: t.focus)
         }
         .onAppear { im.chatVisible = true; im.open(conversation) }
         .onDisappear { im.closeChat() }
@@ -1156,13 +1322,19 @@ struct DYChatScreen: View {
         guard !loadingOlder, !olderExhausted, !im.messages.isEmpty else { return }
         loadingOlder = true
         let keep = im.messages.first?.id
-        let before = im.messages.count
         Task {
-            _ = await im.loadOlder()
-            if im.messages.count <= before { olderExhausted = true }
+            let r = await im.loadOlder()
+            // b54：一次没翻出来不算到顶（网页慢了一下也会这样），连续 3 次都没有才显示「没有更早的消息了」
+            if r.grew { olderMisses = 0 } else { olderMisses += 1 }
+            if olderMisses >= 3 || (r.atTop && !r.grew && olderMisses >= 2) { olderExhausted = true }
             // 保持原来看到的那条还在原位
             if let keep { proxy.scrollTo(keep, anchor: .top) }
             loadingOlder = false
+            // 没到顶、这次又没翻出来：顶上那一格还露着不会再触发 onAppear → 过一会儿自动再试
+            if !r.grew && !olderExhausted {
+                try? await Task.sleep(nanoseconds: 1_200_000_000)
+                loadOlder(proxy)
+            }
         }
     }
 
@@ -1170,6 +1342,8 @@ struct DYChatScreen: View {
 
     private func longPress(_ m: DYIMMessage) {
         guard m.kind != .time else { return }
+        // b54：往上翻出来的旧消息已经不在网页页面上了，网页的菜单点不到它
+        guard m.box >= 0 else { show("较早的消息暂不支持长按操作"); return }
         menuItems = []
         menuFor = m
         Task { let items = await im.menu(for: m); if menuFor == m { menuItems = items } }
@@ -1180,6 +1354,14 @@ struct DYChatScreen: View {
         opening = m.id
         Task {
             guard let a = await im.openCard(m) else { show("这个视频打不开"); opening = nil; return }
+            // b54：转发的评论：只开这一个视频，自动弹评论区并定位到那条评论
+            if m.kind == .comment {
+                let focus = m.cmtId.map { DYCommentFocus(itemId: a.id, commentId: $0, parentId: m.replyTo.flatMap { $0 == m.cmtId ? nil : $0 }) }
+                DYLiveModel.log("DDIMCOMMENT 打开 item=\(a.id) cmt=\(m.cmtId ?? "-") parent=\(m.replyTo ?? "-")")
+                play = DYListTarget(title: conversation.name, items: [a], start: 0, model: nil, focus: focus)
+                opening = nil
+                return
+            }
             // 这个聊天里所有分享的视频串成一列，从点的这条开始，能上下滑着看
             let vids = im.messages.filter { ($0.kind == .share || $0.kind == .video) && $0.itemId != nil }
             var items: [DYAweme] = [a]
@@ -1205,7 +1387,7 @@ struct DYChatScreen: View {
                     if let s = m.sender, !s.isEmpty, !m.fromMe {
                         Text(s).font(.caption).foregroundStyle(.white.opacity(0.55)).padding(.horizontal, 4)
                     }
-                    if m.kind == .share || m.kind == .video {
+                    if m.kind == .share || m.kind == .video || (m.kind == .comment && (m.itemId != nil || m.box >= 0)) {
                         // 视频卡片：长按出菜单、点一下才打开——互斥，松手不会再把视频打开（b45 之前长按松手视频必弹）
                         content(m)
                             .contentShape(Rectangle())
@@ -1258,6 +1440,39 @@ struct DYChatScreen: View {
                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
             }
             .buttonStyle(.plain)
+        case .comment:
+            // b54：转发的评论（照抖音手机版）：左边「评论人：评论内容」最多 3 行，右边视频小图
+            HStack(alignment: .top, spacing: 10) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Group {
+                        if let a = m.author, !a.isEmpty {
+                            Text(a).fontWeight(.semibold) + Text("：") + Text(m.text)
+                        } else { Text(m.text) }
+                    }
+                    .font(.subheadline).foregroundStyle(.white).lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 4) {
+                        Image(systemName: "text.bubble")
+                        Text("评论")
+                    }
+                    .font(.caption2).foregroundStyle(.white.opacity(0.5))
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                if let c = m.cover, !c.isEmpty {
+                    CachedAsyncImage(url: URL(string: c)) { img in img.resizable().scaledToFill() } placeholder: { Color.white.opacity(0.08) }
+                        .frame(width: 56, height: 74)
+                        .clipShape(RoundedRectangle(cornerRadius: 6, style: .continuous))
+                        .overlay {
+                            if opening == m.id { ProgressView().tint(.white) }
+                            else { Image(systemName: "play.fill").font(.caption).foregroundStyle(.white.opacity(0.85)) }
+                        }
+                } else if opening == m.id {
+                    ProgressView().tint(.white).frame(width: 30, height: 30)
+                }
+            }
+            .padding(10)
+            .frame(width: 240)
+            .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(dyBubble))
         case .audio:
             HStack(spacing: 8) {
                 Image(systemName: "waveform").foregroundStyle(.white)

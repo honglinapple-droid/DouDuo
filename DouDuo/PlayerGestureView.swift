@@ -1,5 +1,29 @@
 import SwiftUI
 import UIKit
+import UIKit.UIGestureRecognizerSubclass
+
+/// b54：单击识别器，记下按下 / 抬起的时间和位置、触点大小。用来把「不像单击」的触摸过滤掉（防误触暂停）
+final class DYTapRecognizer: UITapGestureRecognizer {
+    private(set) var downTime: TimeInterval = 0
+    private(set) var upTime: TimeInterval = 0
+    private(set) var downLoc: CGPoint = .zero
+    private(set) var upLoc: CGPoint = .zero
+    private(set) var radius: CGFloat = 0
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        if let t = touches.first {
+            downTime = t.timestamp; downLoc = t.location(in: nil); upTime = downTime; upLoc = downLoc
+            radius = t.majorRadius
+        }
+        super.touchesBegan(touches, with: event)
+    }
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+        if let t = touches.first {
+            upTime = t.timestamp; upLoc = t.location(in: nil)
+            radius = max(radius, t.majorRadius)
+        }
+        super.touchesEnded(touches, with: event)
+    }
+}
 
 // MARK: - UIKit 手势宿主：Pan 起手定方向（横=快进/竖=漏给 ScrollView 切视频）+ 单击/双击/长按
 // 纯 SwiftUI 的 .gesture/.simultaneousGesture 会吞掉整段手势序列导致竖滑分页失效；
@@ -28,7 +52,7 @@ struct PlayerGestureView: UIViewRepresentable {
         let c = context.coordinator
         c.view = v
 
-        let single = UITapGestureRecognizer(target: c, action: #selector(Coordinator.handleSingle(_:)))
+        let single = DYTapRecognizer(target: c, action: #selector(Coordinator.handleSingle(_:)))
         single.numberOfTapsRequired = 1
         single.delegate = c
 
@@ -91,7 +115,28 @@ struct PlayerGestureView: UIViewRepresentable {
         func unlockScroll() { lockedScroll?.panGestureRecognizer.isEnabled = true; lockedScroll = nil }
         init(_ p: PlayerGestureView) { parent = p }
 
-        @objc func handleSingle(_ g: UITapGestureRecognizer) { parent.onSingleTap() }
+        @objc func handleSingle(_ g: UITapGestureRecognizer) {
+            if let t = g as? DYTapRecognizer, parent.verticalFirst {
+                // b54 防误触：按住超过 0.3 秒、或手指移动超过 10pt，都不算单击（手掌、边缘轻擦不再暂停）
+                let hold = t.upTime - t.downTime
+                let move = hypot(t.upLoc.x - t.downLoc.x, t.upLoc.y - t.downLoc.y)
+                if hold > 0.3 || move > 10 {
+                    DYLiveModel.log(String(format: "DDPAUSE 忽略单击 按住=%.2fs 移动=%.0fpt 触点=%.0f y=%.0f", hold, move, t.radius, t.downLoc.y))
+                    return
+                }
+                DYLiveModel.log(String(format: "DDPAUSE 单击 按住=%.2fs 移动=%.0fpt 触点=%.0f x=%.0f y=%.0f", hold, move, t.radius, t.downLoc.x, t.downLoc.y))
+            }
+            parent.onSingleTap()
+        }
+
+        /// b54：顶栏（菜单 / 关注 推荐 直播 消息 / 搜索 我的）连同下方约 20pt 缓冲带：点在这里不算点视频
+        /// （不暂停、不双击点赞）。只拦点按，不拦滑动，从顶上往下 / 往上滑照常切视频
+        private func inTopBand(_ g: UIGestureRecognizer) -> Bool {
+            guard parent.verticalFirst, let w = view?.window else { return false }
+            let y = g.location(in: nil).y
+            // 顶栏：安全区 + 10 + 40 高；再加 20pt 缓冲
+            return y < w.safeAreaInsets.top + 10 + 40 + 20
+        }
 
         @objc func handleDouble(_ g: UITapGestureRecognizer) {
             guard let v = view else { return }
@@ -141,6 +186,10 @@ struct PlayerGestureView: UIViewRepresentable {
 
         func gestureRecognizerShouldBegin(_ g: UIGestureRecognizer) -> Bool {
             if g is UIScreenEdgePanGestureRecognizer { return true }   // 边缘退出始终允许
+            if g is UITapGestureRecognizer, inTopBand(g) {
+                if g is DYTapRecognizer { DYLiveModel.log(String(format: "DDPAUSE 忽略单击 顶栏缓冲带 y=%.0f", g.location(in: nil).y)) }
+                return false
+            }
             // 长按 2 倍速进行中：横向拖进度不许起手（手指漂移不该变成拖进度）
             if g is UIPanGestureRecognizer, longActive { return false }
             guard let pg = g as? UIPanGestureRecognizer, let v = view else { return true }

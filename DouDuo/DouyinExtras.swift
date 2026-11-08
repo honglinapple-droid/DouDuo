@@ -560,10 +560,12 @@ struct DYListPlayer: View {
     @State private var loadingMore = false
     @State private var shareTarget: DYAweme?
     @Environment(\.dyIM) private var im
+    /// b54：从私信「转发的评论」打开：自动弹出评论区并定位到那条评论
+    let focus: DYCommentFocus?
 
     init(bridge: DouyinBridge, title: String, items: [DYAweme], start: Int,
-         loadMore: (() async -> [DYAweme])? = nil, onAuthor: @escaping (DYAweme) -> Void) {
-        self.bridge = bridge; self.title = title
+         loadMore: (() async -> [DYAweme])? = nil, onAuthor: @escaping (DYAweme) -> Void, focus: DYCommentFocus? = nil) {
+        self.bridge = bridge; self.title = title; self.focus = focus
         _items = State(initialValue: items)
         _currentID = State(initialValue: items.indices.contains(start) ? items[start].id : items.first?.id)
         self.loadMore = loadMore; self.onAuthor = onAuthor
@@ -626,17 +628,23 @@ struct DYListPlayer: View {
                 if v { showComments = true } else { DispatchQueue.main.async { if !wideNow { showComments = false } } }
             })) {
                 if let cur = current {
-                    DYCommentPanel(bridge: bridge, aweme: cur, onClose: { showComments = false }, horizontalDismiss: false)
+                    DYCommentPanel(bridge: bridge, aweme: cur, onClose: { showComments = false }, horizontalDismiss: false, focus: focus)
                         .presentationDetents([.fraction(0.62), .large])
                 }
             }
             if wide && showComments, let cur = current {
-                DYSideComments(bridge: bridge, aweme: cur, width: min(380, geo.size.width * 0.36), open: $showComments)
+                DYSideComments(bridge: bridge, aweme: cur, width: min(380, geo.size.width * 0.36), open: $showComments, focus: focus)
                     .id(cur.id)
                     .transition(.move(edge: .trailing).combined(with: .opacity))
             }
             }
             .onChange(of: wide, initial: true) { _, w in wideNow = w }
+        }
+        .task {
+            // b54：转发的评论 → 视频出来后自动打开评论区（定位在评论面板里做）
+            guard focus != nil else { return }
+            try? await Task.sleep(nanoseconds: 450_000_000)
+            showComments = true
         }
         .dyAuthorOverlay($author, bridge: bridge)
         // b50：朋友发来的视频 / 搜索 / 我的 / 作者主页里点开的视频，转发也是「发给朋友」（和推荐页同一个面板）
@@ -746,6 +754,8 @@ struct DYListTarget: Identifiable {
     let model: DYPagedModel?
     /// 还没取详情的视频 id（聊天串播用，滑到后面再取）
     var more: [String] = []
+    /// b54：打开后要定位的评论（私信里转发的评论）
+    var focus: DYCommentFocus? = nil
 }
 
 // MARK: - 搜索
@@ -754,6 +764,14 @@ struct DYSearchScreen: View {
     let bridge: DouyinBridge
     let onAuthor: (DYAweme) -> Void
     @Environment(\.dismiss) private var dismiss
+    /// b54：主页上改成页内覆盖层（不再是系统全屏弹出），关闭走这里；没给就按原来的 dismiss
+    var onClose: (() -> Void)? = nil
+    /// 先收键盘再走：带着键盘直接拿掉页面，键盘收起那一下会吞掉紧接着的一次点按（刚返回马上点「消息」没反应）
+    private func close() {
+        focused = false
+        UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+        if let onClose { onClose() } else { dismiss() }
+    }
     @State private var kw = ""
     @State private var sugs: [DYSug] = []
     @State private var model: DYPagedModel?
@@ -766,13 +784,21 @@ struct DYSearchScreen: View {
     private var history: [String] { historyRaw.split(separator: "\n").map(String.init) }
 
     var body: some View {
-        screenBody.swipeBack { dismiss() }
+        screenBody.swipeBack {
+            #if DEBUG
+            DYLiveModel.log("DDTAP swipeBack close")
+            #endif
+            close() }
     }
 
     private var screenBody: some View {
         VStack(spacing: 0) {
             HStack(spacing: 10) {
-                Button { dismiss() } label: {
+                Button {
+                    #if DEBUG
+                    DYLiveModel.log("DDTAP backBtn close")
+                    #endif
+                    close() } label: {
                     Image(systemName: "chevron.left").font(.headline.weight(.semibold)).foregroundStyle(.white)
                         .frame(width: 44, height: 44).contentShape(Rectangle())
                 }
@@ -931,6 +957,9 @@ struct DYMineScreen: View {
     let onLogin: () -> Void
     let onAuthor: (DYAweme) -> Void
     @Environment(\.dismiss) private var dismiss
+    /// b54：主页上改成页内覆盖层（不再是系统全屏弹出），关闭走这里；没给就按原来的 dismiss
+    var onClose: (() -> Void)? = nil
+    private func close() { if let onClose { onClose() } else { dismiss() } }
     @State private var user: DYUser?
     @State private var userErr: String?
     @State private var kind: DYListKind = .like
@@ -938,13 +967,21 @@ struct DYMineScreen: View {
     @State private var open: DYListTarget?
 
     var body: some View {
-        screenBody.swipeBack { dismiss() }
+        screenBody.swipeBack {
+            #if DEBUG
+            DYLiveModel.log("DDTAP swipeBack close")
+            #endif
+            close() }
     }
 
     private var screenBody: some View {
         VStack(spacing: 0) {
             HStack {
-                Button { dismiss() } label: {
+                Button {
+                    #if DEBUG
+                    DYLiveModel.log("DDTAP backBtn close")
+                    #endif
+                    close() } label: {
                     Image(systemName: "chevron.left").font(.headline.weight(.semibold)).foregroundStyle(.white)
                         .frame(width: 44, height: 44).contentShape(Rectangle())
                 }

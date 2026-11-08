@@ -7,6 +7,19 @@ import AVFoundation
 /// 比依赖视图的 onReceive 稳（视图可能还没渲染、或被 LazyVStack 回收）。
 final class DDPlayback {
     static let shared = DDPlayback()
+    /// b54 诊断：系统打断（来电、闹钟、别的 App 抢声音）、耳机 / 蓝牙断开都会让视频停 → 记下来，查「没碰就暂停」
+    private var diagObs: [NSObjectProtocol] = []
+    init() {
+        let nc = NotificationCenter.default
+        diagObs.append(nc.addObserver(forName: AVAudioSession.interruptionNotification, object: nil, queue: nil) { n in
+            let t = (n.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt) ?? 9
+            DYLiveModel.log("DDPAUSE 系统打断 \(t == 1 ? "开始" : "结束")")
+        })
+        diagObs.append(nc.addObserver(forName: AVAudioSession.routeChangeNotification, object: nil, queue: nil) { n in
+            let r = (n.userInfo?[AVAudioSessionRouteChangeReasonKey] as? UInt) ?? 0
+            if r == AVAudioSession.RouteChangeReason.oldDeviceUnavailable.rawValue { DYLiveModel.log("DDPAUSE 耳机/蓝牙断开") }
+        })
+    }
     private var stoppers: [UUID: () -> Void] = [:]
     private var starters: [UUID: () -> Void] = [:]
     private var lock = NSLock()
@@ -142,6 +155,7 @@ struct PlayerPage: View {
     @State private var dmClock = DYDanmakuClock()
     @State private var timeToken: Any?
     @State private var endObserver: NSObjectProtocol?
+    @State private var tcsObs: NSKeyValueObservation?
     @State private var barWidth: CGFloat = 1
     @State private var vlc: VLCPlayerController?        // AVPlayer 起播失败 → VLC 软解兜底
     @State private var avRetried = false
@@ -433,6 +447,7 @@ struct PlayerPage: View {
     }
 
     private func rebuild() {
+        DYLiveModel.log("DDPLAYER 重建播放器(起播超时) id=\(id.suffix(6))")
         loadFailed = false
         teardownPlayerOnly()
         let item = AVPlayerItem(asset: DYMedia.asset(url))
@@ -493,6 +508,7 @@ struct PlayerPage: View {
 
     /// VLC 软解接管（AVPlayer 两次起不来 / 状态 failed）
     private func startVLC() {
+        DYLiveModel.log("DDPLAYER 换 VLC 软解 id=\(id.suffix(6))")
         teardownPlayerOnly()
         let v = VLCPlayerController()
         if knownDuration > 0 { v.setKnownDuration(knownDuration) }
@@ -523,6 +539,20 @@ struct PlayerPage: View {
     }
 
     private func attachObservers(_ p: AVPlayer) {
+        // b54 诊断：正在播的当前条被「不是我们」停下（缓冲卡住 / 系统暂停）→ 记一笔，查「没碰就暂停」
+        let vid = String(id.suffix(6))
+        tcsObs = p.observe(\.timeControlStatus, options: [.new]) { pl, _ in
+            let st = pl.timeControlStatus
+            DispatchQueue.main.async {
+                guard isActive, isPlaying, !seeking else { return }
+                // 起播 / 刚恢复时的「评估缓冲速度」是正常的一下，不记；只记真正的网速跟不上
+                if st == .waitingToPlayAtSpecifiedRate, pl.reasonForWaitingToPlay == .toMinimizeStalls, pl.currentTime().seconds > 0.5 {
+                    DYLiveModel.log("DDPAUSE 缓冲卡住 id=\(vid) 原因=\(pl.reasonForWaitingToPlay?.rawValue ?? "-")")
+                } else if st == .paused, !{ let d = pl.currentItem?.duration.seconds ?? 0; return d.isFinite && d > 0 && pl.currentTime().seconds >= d - 0.6 }() {   // 播到头自动循环那一下不算
+                    DYLiveModel.log("DDPAUSE 播放器自己停了 id=\(vid) err=\(pl.currentItem?.error?.localizedDescription ?? "-")")
+                }
+            }
+        }
         timeToken = p.addPeriodicTimeObserver(forInterval: CMTime(seconds: 0.25, preferredTimescale: 600), queue: .main) { t in
             MainActor.assumeIsolated {
                 if !seeking { current = t.seconds }
@@ -540,6 +570,7 @@ struct PlayerPage: View {
     }
 
     private func teardownPlayerOnly() {
+        tcsObs?.invalidate(); tcsObs = nil
         if let t = timeToken { player?.removeTimeObserver(t); timeToken = nil }
         if let o = endObserver { NotificationCenter.default.removeObserver(o); endObserver = nil }
         player?.pause()
@@ -548,6 +579,7 @@ struct PlayerPage: View {
     }
 
     private func togglePlay() {
+        DYLiveModel.log("DDPAUSE 单击切换 \(isPlaying ? "→暂停" : "→播放") id=\(id.suffix(6))")
         if let v = vlc { v.togglePlay(); isPlaying = v.isPlaying; dmClock.sync(v.current, playing: v.isPlaying, rate: 1); return }
         guard let p = player else { return }
         if isPlaying { p.pause() } else { p.play() }
@@ -577,6 +609,7 @@ struct PlayerPage: View {
     }
 
     private func teardown() {
+        tcsObs?.invalidate(); tcsObs = nil
         loadFailed = false
         if seeking { cancelSeek() }
         if rateBoost { rateBoost = false; onRateBoost?(false) }

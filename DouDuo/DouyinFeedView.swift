@@ -37,6 +37,8 @@ struct DYAweme: Identifiable, Codable, Equatable {
     /// 封面宽高：接口里视频宽高偶尔标错，用封面再核一遍
     var coverW: Double? = nil
     var coverH: Double? = nil
+    /// b54：背景音乐的播放地址（图文要放它；原来只取了歌名，没地址所以图文没声音）
+    var musicURL: String? = nil
 
     /// followStatus：0 未关注 1 已关注 2 互相关注（未登录时都是 0）
     struct Author: Codable, Equatable { let name: String; let avatar: String?; let secUid: String?; var uid: String? = nil; var followStatus: Int? = nil }
@@ -73,6 +75,13 @@ struct DYActionResp: Decodable {
     enum CodingKeys: String, CodingKey { case status, statusCode = "statusCode", msg }
 }
 
+/// b54：要定位的评论（私信里转发的评论）：哪个视频、哪条评论；是回复时 parentId = 它所在的主评论
+struct DYCommentFocus: Equatable {
+    let itemId: String
+    let commentId: String
+    var parentId: String? = nil
+}
+
 struct DYComment: Identifiable, Decodable, Equatable {
     let id: String
     let text: String
@@ -104,7 +113,7 @@ struct DYLiveRoom: Identifiable, Decodable, Equatable {
 
 private struct DYLiveResp: Decodable { let status: Int; let items: [DYLiveRoom] }
 
-private struct DYFeedPage: Decodable { let status: Int; let items: [DYAweme]; let hasMore: Bool; let msg: String? }
+private struct DYFeedPage: Decodable { let status: Int; let items: [DYAweme]; let hasMore: Bool; let msg: String?; var diag: String? = nil }
 private struct DYCommentPage: Decodable { let status: Int; let items: [DYComment]; let cursor: Int; let hasMore: Bool; let total: Int; let msg: String? }
 
 enum DYError: LocalizedError {
@@ -240,6 +249,7 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
         #if DEBUG
         DYLiveModel.log("DDFEED refresh=\(refreshIndex) http=\(p.status) items=\(p.items.count) playable=\(p.items.filter { $0.play != nil || !$0.images.isEmpty }.count) more=\(p.hasMore) msg=\(p.msg ?? "-")")
         #endif
+        if let dg = p.diag { DYLiveModel.log("DDREC 图文诊断 \(dg)") }
         guard p.status == 200 else { throw DYError.blocked("HTTP \(p.status)") }
         if p.items.isEmpty, let m = p.msg, !m.isEmpty { throw DYError.blocked(m) }
         return (p.items, p.hasMore)
@@ -401,8 +411,9 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
         return s.contains("sessionid") || s == "1"
     }
 
-    func fetchComments(_ id: String, cursor: Int) async throws -> (items: [DYComment], cursor: Int, hasMore: Bool, total: Int) {
-        let d = try await call(Self.commentJS, args: ["id": id, "cursor": String(cursor)])
+    /// b54：insertIDs = 要「置顶」的评论编号（私信里转发的评论 → 打开视频时让抖音把这条排第一）
+    func fetchComments(_ id: String, cursor: Int, insertIDs: String? = nil) async throws -> (items: [DYComment], cursor: Int, hasMore: Bool, total: Int) {
+        let d = try await call(Self.commentJS, args: ["id": id, "cursor": String(cursor), "ins": insertIDs ?? ""])
         let p = try JSONDecoder().decode(DYCommentPage.self, from: d)
         guard p.status == 200 else { throw DYError.blocked("HTTP \(p.status)") }
         return (p.items, p.cursor, p.hasMore, p.total)
@@ -526,6 +537,7 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
         coverH: (v.cover && v.cover.height) || (v.origin_cover && v.origin_cover.height) || 0,
         stats: { digg: st.digg_count || 0, comment: st.comment_count || 0, collect: st.collect_count || 0, share: st.share_count || 0 },
         music: (a.music && a.music.title) || '',
+        musicURL: (a.music && a.music.play_url && (first(a.music.play_url) || (/^http/.test(a.music.play_url.uri || '') ? a.music.play_url.uri : null))) || null,
         createTime: a.create_time || 0,
         tags: (a.video_tag || []).map(t => t && t.tag_name).filter(Boolean),
         userDigged: a.user_digged ? 1 : 0,
@@ -544,7 +556,10 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
     const d = parse(r.t);
     if (!d) return JSON.stringify({ status: r.s, items: [], hasMore: false, msg: (r.t || '').replace(/[^\u4e00-\u9fa5A-Za-z0-9 ]/g, '').slice(-20) });
     const items = (d.aweme_list || []).filter(a => a && a.video && !a.is_ads && !(a.raw_ad_data)).map(mapA);
-    return JSON.stringify({ status: r.s, items, hasMore: !!d.has_more, msg: d.status_msg || null });
+    // b54 诊断（只统计、不改挑选）：这一页抖音给了几条图文、其中有几条因为没有 video 字段被上面那行筛掉
+    const al = d.aweme_list || [], isImg = a => a && ((a.images && a.images.length) || a.aweme_type === 68);
+    const diag = 'raw=' + al.length + ' 图文=' + al.filter(isImg).length + ' 图文无video=' + al.filter(a => isImg(a) && !a.video).length + ' types=' + [...new Set(al.map(a => a && a.aweme_type))].join('/');
+    return JSON.stringify({ status: r.s, items, hasMore: !!d.has_more, msg: d.status_msg || null, diag });
     """#
 
     private static let watchJS = #"""
@@ -562,6 +577,7 @@ final class DouyinBridge: NSObject, ObservableObject, WKNavigationDelegate {
 
     private static let commentJS = #"""
     const P = Object.assign({}, base, { aweme_id: id, cursor: cursor, count: '20', item_type: '0', whale_cut_token: '', cut_version: '1', rcFT: '' });
+    if (typeof ins === 'string' && ins) P.insert_ids = ins;
     const r = await req('GET', '/aweme/v1/web/comment/list/?' + new URLSearchParams(P).toString());
     const d = parse(r.t);
     if (!d) return JSON.stringify({ status: r.s, items: [], cursor: 0, hasMore: false, total: 0, msg: 'blocked' });
@@ -682,7 +698,8 @@ final class DYPreloader {
         if let c = a.cover.flatMap(URL.init(string:)) { Task { _ = await ImageCache.shared.load(c) } }
     }
 
-    func unpinAll() { pinned.removeAll() }
+    /// except：后台其它备好的批次，第一条继续钉着（b54 会同时备 2~3 批）
+    func unpinAll(except keep: Set<String> = []) { pinned = pinned.intersection(keep) }
 
     /// 页面起播时来领；领走后由页面负责释放
     func take(_ id: String) -> AVPlayer? {
@@ -855,6 +872,10 @@ struct DouyinFeedScreen: View {
     /// 刷新提速：后台提前拼好的「下一批」，点刷新直接换上，不等网络
     @State private var nextBatches: [DYFeedModel] = []     // 常备两批
     @State private var preparingNext = false
+    /// b54：这次连续刷了多久（回到前台重新计时）。刷得越久，后台备的批数越多：刚开 1 批，5 分钟 2 批，10 分钟 3 批
+    @State private var watchSince = Date()
+    /// b54：后台备批请求的上一次时间。两次之间至少隔 20 秒（之前一下备两批被抖音限流）
+    @State private var lastPrepAt = Date.distantPast
     @State private var pendingRefresh = false
     @State private var followRefresh = 0
     @State private var narrow = false
@@ -872,6 +893,8 @@ struct DouyinFeedScreen: View {
     @State private var initialized = false
     @State private var refreshing = false
     @State private var showComments = false
+    /// 模拟器自测用（DOUDUO_FOCUSCMT）：正式包里永远是 nil
+    @State private var debugFocus: DYCommentFocus?
     /// 当前条正在长按 2 倍速：顶栏跟着藏起来（沉浸）
     @State private var boosting = false
     @State private var followPanelInset: CGFloat = 0
@@ -889,6 +912,13 @@ struct DouyinFeedScreen: View {
     @AppStorage("douyin_danmaku_v2") private var danmakuOn = false
     @State private var showMine = false
     @State private var showMessages = false
+    /// b54：顶上页面正在滑走 → 先让它不接点按（不然刚点返回、马上再点「消息」，点按会落在滑走中的旧页面上被吞掉）
+    @State private var pageClosing = false
+    /// b54：顶上页面盖着主页（含滑出动画期间）。左上菜单是系统玻璃按钮，会画在覆盖层上面并抢走「返回」的点按 → 盖着时把主页顶栏藏起来
+    @State private var pageCovering = false
+    /// b54：顶上页面正在滑进来。滑入途中「返回」键在移动，连点「消息」/ 搜索的第二下会正好点在路过的返回键上 → 刚开就关、一直闪。滑入期间不接点按（底下有挡板接住）
+    @State private var pageOpening = false
+    @State private var openSeq = 0
     @State private var shareTarget: DYAweme?
     @StateObject private var im = DYIMModel()
     @State private var authorTarget: DYAweme.Author?
@@ -933,7 +963,7 @@ struct DouyinFeedScreen: View {
                 if v { showComments = true } else { DispatchQueue.main.async { if !wideNow { showComments = false } } }
             })) {
                 if let cur = current {
-                    DYCommentPanel(bridge: bridge, aweme: cur, onClose: { showComments = false }, horizontalDismiss: false)
+                    DYCommentPanel(bridge: bridge, aweme: cur, onClose: { showComments = false }, horizontalDismiss: false, focus: debugFocus)
                         .presentationDetents([.fraction(0.62), .large])
                         .presentationDragIndicator(.visible)
                 }
@@ -995,6 +1025,37 @@ struct DouyinFeedScreen: View {
                 DispatchQueue.main.asyncAfter(deadline: .now() + sec) { tab = .live }
             }
             let env = ProcessInfo.processInfo.environment
+            // 模拟器自测：DOUDUO_FAKEIMG=1 → 在当前这条后面插一条假图文（3 张图 + 背景音乐），测自动翻页和音乐
+            if env["DOUDUO_FAKEIMG"] == "1", let i = currentIndex {
+                var fake = DYAweme(id: "fakeimg1", desc: "测试图文", width: 0, height: 0, duration: 0, play: nil, cover: nil,
+                                   images: (1...3).map { "https://picsum.photos/id/\($0 * 10)/600/900" },
+                                   author: .init(name: "测试", avatar: nil, secUid: nil), stats: .init(digg: 0, comment: 0, collect: 0, share: 0),
+                                   music: "测试音乐", userDigged: nil, isCollect: nil)
+                fake.musicURL = "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3"
+                feed.items.insert(fake, at: i + 1)
+                DYLiveModel.log("DDIMG 假图文插入 at=\(i + 1) n=\(feed.items.count)")
+            }
+            // 模拟器自测：DOUDUO_FOCUSCMT=main|reply|gone → 模拟「点私信里转发的评论」，测评论定位 / 高亮 / 已删除提示
+            if let mode = env["DOUDUO_FOCUSCMT"], let cur = current {
+                Task {
+                    guard let r = try? await bridge.fetchComments(cur.id, cursor: 0) else { DYLiveModel.log("DDIMCOMMENT 自测 拉评论失败"); return }
+                    var f: DYCommentFocus?
+                    if mode == "gone" { f = DYCommentFocus(itemId: cur.id, commentId: "7000000000000000001") }
+                    else if mode == "reply", let p = r.items.first(where: { $0.replies > 0 }) {
+                        for _ in 0..<4 {
+                            do {
+                                let rr = try await bridge.fetchReplies(cur.id, commentID: p.id, cursor: 0)
+                                if let x = rr.items.last { f = DYCommentFocus(itemId: cur.id, commentId: x.id, parentId: p.id); break }
+                                DYLiveModel.log("DDIMCOMMENT 自测 回复为空")
+                            } catch { DYLiveModel.log("DDIMCOMMENT 自测 回复失败 \(error)") }
+                            try? await Task.sleep(nanoseconds: 1_500_000_000)
+                        }
+                    } else if let x = r.items.last { f = DYCommentFocus(itemId: cur.id, commentId: x.id) }
+                    DYLiveModel.log("DDIMCOMMENT 自测 n=\(r.items.count) mode=\(mode) focus=\(f.map { "\($0.commentId)/\($0.parentId ?? "-")" } ?? "nil")")
+                    debugFocus = f
+                    showComments = true
+                }
+            }
             if let n = env["DOUDUO_IMPROBE"] {
                 try? await Task.sleep(nanoseconds: 14_000_000_000)
                 await im.probe(n)
@@ -1002,8 +1063,8 @@ struct DouyinFeedScreen: View {
             if let o = env["DOUDUO_OPEN"] {
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 switch o {
-                case "search": showSearch = true
-                case "mine": showMine = true
+                case "search": openPage { showSearch = true }
+                case "mine": openPage { showMine = true }
                 case "follow": tab = .follow
                 case "author": authorTarget = current?.author
                 case "comments": showComments = true
@@ -1040,6 +1101,9 @@ struct DouyinFeedScreen: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
             saveSession(now: true)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willEnterForegroundNotification)) { _ in
+            watchSince = Date()   // 从后台回来重新计「连续刷了多久」
         }
         .onReceive(Timer.publish(every: 5, on: .main, in: .common).autoconnect()) { _ in
             if DDPlayback.shared.appIsActive { saveSession() }
@@ -1119,7 +1183,8 @@ struct DouyinFeedScreen: View {
     }
 
     private func selectTab(_ target: DYTab) {
-        if target == .messages { showMessages = true; return }
+        DYLiveModel.log("DDUI 顶栏 \(target)")
+        if target == .messages { openPage { showMessages = true }; return }
         if tab == .recommend && target == .recommend {
             Task { await refreshRecommendations() }
         } else if tab == .follow && target == .follow {
@@ -1144,17 +1209,31 @@ struct DouyinFeedScreen: View {
             // 后台早就备好了：直接换，不等网络
             replacement = nextBatches.remove(at: i); instant = true
         } else {
-            while feed.loading {
+            // b54：主线正在拉时最多等 3 秒（原来没有上限，网络慢时点「推荐」一直干等，像没点中）。
+            // 等不到就直接另起一个请求（新一批是单独的列表，和主线互不覆盖）。转圈在点下去那一刻就出来了
+            let waitUntil = Date().addingTimeInterval(3)
+            while feed.loading && Date() < waitUntil {
                 do { try await Task.sleep(nanoseconds: 100_000_000) }
                 catch { return }
             }
             guard !Task.isCancelled else { return }
+            // 等的这 3 秒里后台那批可能刚好备好了 → 直接用
+            if let i = nextBatches.firstIndex(where: { !$0.items.filter({ !previous.contains($0.id) }).isEmpty }) {
+                let ready = nextBatches.remove(at: i)
+                await finishRefresh(ready, previous: previous, instant: true)
+                return
+            }
             replacement = DYFeedModel()
             replacement.followed = feed.followed
             // 凑够 4 条再换，不再边塞边播（边塞边播画面会一跳一跳）
             await replacement.loadMore(bridge, want: 6)
             guard !Task.isCancelled else { return }
         }
+        await finishRefresh(replacement, previous: previous, instant: instant)
+    }
+
+    /// 把新的一批换上来（刷新的后半段）
+    @MainActor private func finishRefresh(_ replacement: DYFeedModel, previous: Set<String>, instant: Bool) async {
         let fresh = replacement.items.filter { !previous.contains($0.id) }
         guard !fresh.isEmpty else {
             showToast(replacement.error ?? "暂时没有新的推荐，已保留当前视频")
@@ -1164,7 +1243,7 @@ struct DouyinFeedScreen: View {
         showComments = false
         scrollEndTask?.cancel(); userScrolling = false
         // 钉住的第一条留着（秒开），其余释放
-        preloader.unpinAll()
+        preloader.unpinAll(except: Set(nextBatches.compactMap { $0.items.first?.id }))
         feed.reset()
         feed.items = fresh
         feed.liked.formUnion(replacement.liked)
@@ -1186,17 +1265,28 @@ struct DouyinFeedScreen: View {
         scheduleNextBatch()
     }
 
+    /// b54：后台该备几批：刚打开 1 批；连续刷 5 分钟以上 2 批；10 分钟以上 3 批（每批约 6 条，最多约 20 条）
+    private var batchTarget: Int {
+        let t = Date().timeIntervalSince(watchSince)
+        return t >= 600 ? 3 : (t >= 300 ? 2 : 1)
+    }
+
     /// 看了一会儿之后，在后台悄悄把下一批拼好、第一条预加载好
-    /// 后台常备一批（之前两批太费请求，被抖音限流）：第一条视频起来 1.5 秒后开始备；换掉马上补
+    /// 第一条视频起来 1.5 秒后开始备；换掉马上补。b54：刷得越久备得越多，两次请求之间至少隔 20 秒（防限流）。
+    /// 只是「提前拉」，拉的接口、挑选和排序跟原来一模一样
     private func scheduleNextBatch() {
-        guard nextBatches.count < 1, !preparingNext else { return }
+        guard nextBatches.count < batchTarget, !preparingNext else { return }
         preparingNext = true
         Task {
             try? await Task.sleep(nanoseconds: 1_500_000_000)
             defer { preparingNext = false }
-            while nextBatches.count < 1 {
+            while nextBatches.count < batchTarget {
+                // 离上一次备批不到 20 秒：等够再拉（等的过程中条件变了就下次再说）
+                let gap = 20 - Date().timeIntervalSince(lastPrepAt)
+                if gap > 0 { try? await Task.sleep(nanoseconds: UInt64(gap * 1_000_000_000)) }
                 // 只在空闲时备批：主线没在拉、后面已经备够 10 条（否则和主线抢那条 3 MB 的请求）
                 guard !refreshing, !feed.loading, let i = currentIndex, feed.items.count - i - 1 >= 10 else { break }
+                lastPrepAt = Date()
                 let m = DYFeedModel()
                 m.followed = feed.followed
                 await m.loadMore(bridge, want: 6)
@@ -1204,7 +1294,8 @@ struct DouyinFeedScreen: View {
                 m.items.removeAll { seen.contains($0.id) }
                 guard !m.items.isEmpty else { break }
                 nextBatches.append(m)
-                if let first = m.items.first { preloader.warm(first) }
+                if let first = m.items.first { preloader.warm(first) }   // 每批第一条提前缓冲好，换批瞬间就能播
+                DYLiveModel.log("DDREFRESH 后台备好 \(nextBatches.count)/\(batchTarget) 批 n=\(m.items.count)")
             }
         }
     }
@@ -1252,7 +1343,8 @@ struct DouyinFeedScreen: View {
             }
             topBar.padding(.top, 10)
                 .padding(.trailing, tab == .follow ? followPanelInset : 0)   // 关注页分屏评论开着时让位给面板
-                .opacity(boosting ? 0 : 1)
+                .opacity(boosting || pageCovering ? 0 : 1)
+                .allowsHitTesting(!pageCovering)
                 .animation(.easeInOut(duration: 0.2), value: boosting)
             if let t = feed.toast {
                 Text(t).font(.footnote.weight(.medium)).foregroundStyle(.white)
@@ -1274,9 +1366,6 @@ struct DouyinFeedScreen: View {
             if t == .recommend { focusCurrent() } else { preloader.clear() }
             if t != .live { live.stop() }
         }
-        .fullScreenCover(isPresented: $showSearch) {
-            DYSearchScreen(bridge: bridge, onAuthor: { a in authorTarget = a.author })
-        }
         .sheet(item: $shareTarget) { a in
             DYFriendPicker(im: im, title: "发送给朋友") { friend in
                 showToast("发送中…")
@@ -1286,26 +1375,94 @@ struct DouyinFeedScreen: View {
             .presentationDetents([.medium, .large])
             .presentationBackground(Color(red: 0.12, green: 0.12, blue: 0.13))
         }
-        .fullScreenCover(isPresented: $showMessages) {
-            DYMessagesScreen(im: im, bridge: bridge, onClose: { showMessages = false },
-                             onLogin: { showMessages = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { web = DYWebTarget(url: DouyinWeb.home) } },
-                             onAuthor: { authorTarget = $0.author })
-        }
         .overlay(alignment: .top) {
             if let b = im.banner, !showMessages {
-                DYIMBannerView(banner: b, onTap: { im.pendingOpen = b.name; im.banner = nil; showMessages = true }, onClose: { im.banner = nil })
+                DYIMBannerView(banner: b, onTap: { im.pendingOpen = b.name; im.banner = nil; openPage { showMessages = true } }, onClose: { im.banner = nil })
                     .padding(.top, max(insets.top, 8) + 44)
                     .transition(.move(edge: .top).combined(with: .opacity))
             }
         }
         .animation(.snappy, value: im.banner)
-        .fullScreenCover(isPresented: $showMine) {
-            DYMineScreen(bridge: bridge,
-                         onLogin: { showMine = false; DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { web = DYWebTarget(url: DouyinWeb.home) } },
-                         onAuthor: { a in authorTarget = a.author })
-        }
+        // b54：消息 / 搜索 / 我的 改成页内覆盖层，从右边滑进来。原来是系统全屏弹出（fullScreenCover），
+        // 弹出 / 收起的动画期间系统会把点按吞掉：连点「消息」、刚返回马上再点 → 点了没反应、页面来回闪、看着像卡住。
+        // 覆盖层的动画不挡点按，连点也不会乱。作者主页（dyAuthorOverlay）在更外层，从这些页面点进作者仍然盖在上面
+        .overlay { topPages }
         // b50：私信模型放进环境，搜索 / 我的 / 作者主页 / 聊天里点开的视频，转发都走「发给朋友」
         .environment(\.dyIM, im)
+    }
+
+    /// b54：消息 / 搜索 / 我的（页内覆盖层）。点返回键滑出去；右滑返回时页面已经跟手滑走，收起不再加动画
+    @ViewBuilder private var topPages: some View {
+        ZStack {
+            // 页面滑进来的那 0.3 秒里，它还没盖满屏幕：手快再点一下会穿到底下的主页（点开左上菜单、点到别的标签）→ 闪、像卡住。
+            // 只要有页面开着，先铺一层透明挡板（不带动画，立刻出现 / 立刻消失）
+            // b54：挡板跟 pageCovering 走（开页时无动画立刻出现、关页时无动画立刻消失）。原来跟着 showMessages 走，
+            // 关页动画那半秒里挡板还留着 → 刚点返回马上再点「消息」，点在挡板上没反应（用户说的「一直闪、卡住」）
+            if pageCovering {
+                Color.black.opacity(0.001).ignoresSafeArea().contentShape(Rectangle()).onTapGesture {}
+                    .transition(.identity)
+            }
+            if showMine {
+                DYMineScreen(bridge: bridge,
+                             onLogin: { closePage { showMine = false }; DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { web = DYWebTarget(url: DouyinWeb.home) } },
+                             onAuthor: { a in authorTarget = a.author },
+                             onClose: { closePage { showMine = false } })
+                    .allowsHitTesting(!pageClosing && !pageOpening)
+                    .transition(.move(edge: .trailing))
+                    .zIndex(1)
+            }
+            if showSearch {
+                DYSearchScreen(bridge: bridge, onAuthor: { a in authorTarget = a.author },
+                               onClose: { closePage { showSearch = false } })
+                    .allowsHitTesting(!pageClosing && !pageOpening)
+                    .transition(.move(edge: .trailing))
+                    .zIndex(2)
+            }
+            if showMessages {
+                DYMessagesScreen(im: im, bridge: bridge, onClose: { closePage { showMessages = false } },
+                                 onLogin: { closePage { showMessages = false }; DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { web = DYWebTarget(url: DouyinWeb.home) } },
+                                 onAuthor: { authorTarget = $0.author })
+                    .allowsHitTesting(!pageClosing && !pageOpening)
+                    .transition(.move(edge: .trailing))
+                    .zIndex(3)
+            }
+        }
+    }
+
+    /// 打开顶上的页面：从右边滑进来
+    private func openPage(_ set: @escaping () -> Void) {
+        // 正在收起的那一瞬间又点了：排在收起后面再打开（不然打开被收起盖掉，看着像点了没反应）
+        if pageClosing { DispatchQueue.main.async { openPage(set) }; return }
+        #if DEBUG
+        DYLiveModel.log("DDTAP openPage \(Date().timeIntervalSince1970) m=\(showMessages) s=\(showSearch) me=\(showMine)")
+        #endif
+        var t = Transaction(); t.disablesAnimations = true
+        withTransaction(t) { pageCovering = true; pageOpening = true }
+        withAnimation(.spring(response: 0.36, dampingFraction: 0.9)) { set() }
+        // b54：0.28 秒页面已基本到位（只差几十分之一），这时就放开点按。原来等动画完全结束（约 0.6 秒），
+        // 刚打开马上点返回 → 点了没反应，像卡住
+        openSeq += 1
+        let seq = openSeq
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.28) { if openSeq == seq { pageOpening = false } }
+    }
+
+    /// 收起：滑出到右边。右滑返回时页面已经被拖到屏幕外（DYFollowSwipeBack 先滑出再调这里），再往右移看不见，不会闪
+    private func closePage(_ set: @escaping () -> Void) {
+        // 两步：这一帧先把要走的页面设成不接点按（拿掉以后它会保持这个状态滑走），下一帧再滑出去并恢复
+        pageClosing = true
+        #if DEBUG
+        DYLiveModel.log("DDTAP closePage \(Date().timeIntervalSince1970) opening=\(pageOpening)")
+        #endif
+        DispatchQueue.main.async {
+            withAnimation(.spring(response: 0.32, dampingFraction: 0.92)) { set() }
+            pageClosing = false
+            // 一点返回，主页顶栏立刻放出来、立刻能点（页面往右滑走，左上角马上就露出来）。原来等完全滑走才放 →
+            // 刚点返回马上再点「消息」/ 搜索，那半秒顶栏是藏着的，点了没反应，像卡住
+            if !(showMessages || showSearch || showMine) {
+                var t = Transaction(); t.disablesAnimations = true
+                withTransaction(t) { pageCovering = false }
+            }
+        }
     }
 
     /// 顶部一排：左菜单，中间 关注/推荐/直播，右边 搜索 / 我的
@@ -1316,8 +1473,8 @@ struct DouyinFeedScreen: View {
             tabSwitcher
             Spacer(minLength: 4)
             HStack(spacing: narrow ? 0 : 6) {
-                topIcon("magnifyingglass", "douyin.search") { showSearch = true }
-                topIcon("person.crop.circle", "douyin.mine") { showMine = true }
+                topIcon("magnifyingglass", "douyin.search") { openPage { showSearch = true } }
+                topIcon("person.crop.circle", "douyin.mine") { openPage { showMine = true } }
             }
         }
         .frame(height: 40)
@@ -1331,7 +1488,7 @@ struct DouyinFeedScreen: View {
                 .font(.system(size: theme.typography.pointSize(.headline), weight: .semibold))
                 .foregroundStyle(theme.media.onMedia.color(for: scheme))
                 .frame(width: 40, height: 40)
-                .contentShape(Rectangle())
+                .contentShape(DYHitShape(dx: 2, dy: 2))
                 .themeShadow(.mediaLabel)
                 .dyGlass(in: Circle())
         }
@@ -1357,7 +1514,19 @@ struct DouyinFeedScreen: View {
                                 else { Capsule().fill(fg).frame(width: 18, height: 3).offset(y: -4) }
                             }
                         }
-                        .contentShape(Rectangle())
+                        // b54：「消息」右上角红色未读气泡（和抖音一样），看完自动消失
+                        .overlay(alignment: .topTrailing) {
+                            if t == .messages, im.unreadTotal > 0 {
+                                Text(im.unreadTotal > 99 ? "99+" : "\(im.unreadTotal)")
+                                    .font(.system(size: 10, weight: .bold)).foregroundStyle(.white)
+                                    .padding(.horizontal, 4).frame(minWidth: 16, minHeight: 16)
+                                    .background(Capsule().fill(Color(red: 1, green: 0.17, blue: 0.33)))
+                                    .offset(x: 12, y: 2)
+                                    .allowsHitTesting(false)
+                            }
+                        }
+                        // b54：点击区横向吃掉一半字间空隙、上下各多 2pt（每个标签至少 44×44），手指偏一点也点得中，不会穿到视频上暂停
+                        .contentShape(DYHitShape(dx: (narrow ? 12 : 18) / 2 + 1, dy: 2))
                 }
                 .buttonStyle(.plain)
             }
@@ -2116,12 +2285,8 @@ struct DYVideoPage: View {
                                     onSavePosition: onSavePosition, onClose: {}, fillWidth: autoFit,
                                     danmaku: danmakuOn ? danmaku : [])
             } else {
-                TabView {
-                    ForEach(item.images, id: \.self) { s in
-                        CachedAsyncImage(url: URL(string: s)) { img in img.resizable().scaledToFit() } placeholder: { ProgressView() }
-                    }
-                }
-                .tabViewStyle(.page(indexDisplayMode: .always))
+                // b54：图文：背景音乐 + 每 3 秒自动翻页（DouyinImagePost.swift）
+                DYImagePost(item: item, isActive: isCurrent)
             }
 
             if heart {
@@ -2269,6 +2434,7 @@ struct DYVideoPage: View {
                 .frame(width: 46, height: 46)
                 .clipShape(Circle())
                 .overlay(Circle().stroke(fg, lineWidth: 1.5))
+                .contentShape(DYHitShape(dx: 9, dy: 8))   // b54：头像点击区和下面的按钮连上，不留缝
             }
             .buttonStyle(.plain)
             .accessibilityIdentifier("douyin.author")
@@ -2320,9 +2486,24 @@ struct DYVideoPage: View {
                 Image(systemName: icon).font(.system(size: theme.typography.pointSize(.displayLarge))).foregroundStyle(tint)
                 Text(text).font(.caption2.weight(.semibold)).foregroundStyle(theme.media.onMedia.color(for: scheme))
             }
+            // b54：点击区扩成整块（宽至少 64、上下各吃掉一半按钮间距 8pt），整列上下不留缝：图标旁边、图标和数字之间点到都算按钮，
+            // 不会再穿到视频上变成暂停。只改能点的范围，按钮位置、大小一点没动
+            .contentShape(DYHitShape(dx: 12, dy: 8, minWidth: 64))
         }
         .buttonStyle(.plain)
         .accessibilityIdentifier(id)
+    }
+}
+
+/// b54：点击区形状：比视图本身向外扩 dx / dy（不改布局，只扩大能点的范围）；minWidth：至少这么宽（居中扩）
+struct DYHitShape: Shape {
+    var dx: CGFloat
+    var dy: CGFloat
+    var minWidth: CGFloat = 0
+    func path(in r: CGRect) -> Path {
+        var x = r.insetBy(dx: -dx, dy: -dy)
+        if x.width < minWidth { x = x.insetBy(dx: -(minWidth - x.width) / 2, dy: 0) }
+        return Path(x)
     }
 }
 
@@ -2360,6 +2541,11 @@ struct DYCommentPanel: View {
     /// b49：外面接管跟手（侧栏让出多少、视频就变宽多少）：拖动中报位移，松手报「要不要关」
     var onDrag: ((CGFloat) -> Void)?
     var onDragEnd: ((Bool) -> Void)?
+    /// b54：私信里点「转发的评论」打开时，要定位、高亮的那条评论
+    var focus: DYCommentFocus? = nil
+    @State private var focusDone = false
+    @State private var highlight: String?
+    @State private var focusNote: String?
     @State private var items: [DYComment] = []
     @State private var cursor = 0
     @State private var hasMore = true
@@ -2381,9 +2567,10 @@ struct DYCommentPanel: View {
     @FocusState private var inputFocused: Bool
 
     init(bridge: DouyinBridge, aweme: DYAweme, onClose: (() -> Void)?, horizontalDismiss: Bool = true,
-         onDrag: ((CGFloat) -> Void)? = nil, onDragEnd: ((Bool) -> Void)? = nil) {
+         onDrag: ((CGFloat) -> Void)? = nil, onDragEnd: ((Bool) -> Void)? = nil, focus: DYCommentFocus? = nil) {
         self.bridge = bridge; self.aweme = aweme; self.onClose = onClose
         self.horizontalDismiss = horizontalDismiss; self.onDrag = onDrag; self.onDragEnd = onDragEnd
+        self.focus = focus?.itemId == aweme.id ? focus : nil
     }
 
     /// 跟手：面板随手指向右移动，松手超过面板宽 35% 或往右甩得够快就收起，否则弹回；向左一滑（>80pt）也收起。
@@ -2446,8 +2633,14 @@ struct DYCommentPanel: View {
             .foregroundStyle(.themeTextPrimary)
             .padding(.leading, 16).padding(.trailing, 4).padding(.vertical, 6)
             Divider()
+            ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 16) {
+                    if let n = focusNote {
+                        Text(n).font(.caption).foregroundStyle(.themeTextSecondary)
+                            .frame(maxWidth: .infinity).padding(.vertical, 6)
+                            .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.06)))
+                    }
                     ForEach(items) { c in
                         VStack(alignment: .leading, spacing: 10) {
                             row(c)
@@ -2465,6 +2658,11 @@ struct DYCommentPanel: View {
                     }
                 }
                 .padding(16)
+            }
+            .onChange(of: highlight) { _, h in
+                guard let h else { return }
+                withAnimation(.easeInOut(duration: 0.3)) { proxy.scrollTo(h, anchor: .top) }
+            }
             }
             Divider()
             inputBar
@@ -2535,6 +2733,8 @@ struct DYCommentPanel: View {
 
     private func row(_ c: DYComment) -> some View {
         rowBody(c)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Color.yellow.opacity(highlight == c.id ? 0.22 : 0)).padding(-6))
+            .id(c.id)
             .contentShape(Rectangle())
             .onTapGesture { guard !c.id.hasPrefix("local-") else { return }; replyTo = c; inputFocused = true }
     }
@@ -2601,6 +2801,44 @@ struct DYCommentPanel: View {
         .padding(.leading, 42)
     }
 
+    /// b54：定位私信里转发的那条评论：主评论直接高亮；是回复就先展开它所在的主评论，再高亮那条回复。
+    /// 前 3 页都找不到 → 提示「这条评论已不存在」
+    @MainActor private func runFocus() async {
+        guard let f = focus, !focusDone else { return }
+        let root = f.parentId ?? f.commentId
+        if items.contains(where: { $0.id == root }) {
+            focusDone = true
+            if let parent = f.parentId, let pc = items.first(where: { $0.id == parent }) {
+                for _ in 0..<5 {
+                    if replies[parent]?.contains(where: { $0.id == f.commentId }) == true { break }
+                    if replies[parent] != nil && replyMore[parent] != true { break }
+                    await loadReplies(pc)
+                    if replyErr[parent] != nil { break }   // 回复拉不到：退回高亮主评论
+                }
+                let found = replies[parent]?.contains(where: { $0.id == f.commentId }) == true
+                flash(found ? f.commentId : parent)
+                DYLiveModel.log("DDIMCOMMENT 定位 回复 found=\(found)")
+            } else {
+                flash(root)
+                DYLiveModel.log("DDIMCOMMENT 定位 主评论 ok")
+            }
+        } else if !hasMore || items.count >= 60 {
+            focusDone = true
+            focusNote = "这条评论已不存在"
+            DYLiveModel.log("DDIMCOMMENT 定位 没找到 n=\(items.count)")
+        } else {
+            // 还没找到、还有下一页：接着翻（最多翻到 60 条）
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { Task { await load() } }
+        }
+    }
+
+    private func flash(_ id: String) {
+        withAnimation(.easeInOut(duration: 0.25)) { highlight = id }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            withAnimation(.easeInOut(duration: 0.8)) { if highlight == id { highlight = nil } }
+        }
+    }
+
     private func loadReplies(_ c: DYComment) async {
         guard !replyLoading.contains(c.id) else { return }
         replyLoading.insert(c.id)
@@ -2624,13 +2862,15 @@ struct DYCommentPanel: View {
         loading = true
         defer { loading = false }
         do {
-            let r = try await bridge.fetchComments(aweme.id, cursor: cursor)
+            let ins = (cursor == 0 && !focusDone) ? focus.map { $0.parentId ?? $0.commentId } : nil
+            let r = try await bridge.fetchComments(aweme.id, cursor: cursor, insertIDs: ins)
             let seen = Set(items.map(\.id))
             items.append(contentsOf: r.items.filter { !seen.contains($0.id) })
             cursor = r.cursor
             hasMore = r.hasMore && !r.items.isEmpty
             total = max(total, r.total, aweme.stats.comment)
             error = nil
+            if focus != nil && !focusDone { await runFocus() }
             #if DEBUG
             if ProcessInfo.processInfo.environment["DOUDUO_AUTOREPLY"] == "1", let c = items.first(where: { $0.replies > 0 }), replies[c.id] == nil {
                 Task { await loadReplies(c) }
@@ -2652,6 +2892,7 @@ struct DYSideComments: View {
     let width: CGFloat
     @Binding var open: Bool
     var onClosed: (() -> Void)? = nil
+    var focus: DYCommentFocus? = nil
     @State private var drag: CGFloat = 0
 
     var body: some View {
@@ -2663,7 +2904,7 @@ struct DYSideComments: View {
                            onDrag: { drag = min($0, width) },
                            onDragEnd: { c in
                                if c { close() } else { withAnimation(.spring(response: 0.35, dampingFraction: 0.85)) { drag = 0 } }
-                           })
+                           }, focus: focus)
                 .padding(.bottom, inset)
                 .background(alignment: .bottom) { Rectangle().fill(.regularMaterial).frame(height: inset) }
                 .frame(width: width, height: g.size.height)

@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import UIKit.UIGestureRecognizerSubclass
 import AVFoundation
 
 /// 后台/失焦立刻停声：用 AppDelegate 回调，比 SwiftUI 的 scenePhase 稳
@@ -88,6 +89,7 @@ struct DouDuoApp: App {
             } else {
                 DouyinFeedScreen()
                     .preferredColorScheme(.dark)
+                    .onAppear { DDTouchLog.install() }
             }
             #else
             DouyinFeedScreen()
@@ -101,7 +103,9 @@ struct DouDuoApp: App {
             #endif
             switch phase {
             case .active: DDPlayback.shared.resumeAll()
-            default: DDPlayback.shared.pauseAll()
+            default:
+                DYLiveModel.log("DDPAUSE App 失焦/切后台 phase=\(String(describing: phase))")
+                DDPlayback.shared.pauseAll()
             }
         }
     }
@@ -192,5 +196,36 @@ struct LocalVideoPlaybackView: View {
                 LocalVideoLaunch.log("DDAPI done")
             
     }
+}
+#endif
+
+
+#if DEBUG
+/// 调试用：每次手指按下记一行「点在哪、落到哪个视图」（查点了没反应）
+final class DDTouchLog: UIGestureRecognizer, UIGestureRecognizerDelegate {
+    static func install() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+            for sc in UIApplication.shared.connectedScenes.compactMap({ $0 as? UIWindowScene }) {
+                for w in sc.windows where !(w.gestureRecognizers ?? []).contains(where: { $0 is DDTouchLog }) {
+                    let g = DDTouchLog(target: nil, action: nil)
+                    g.cancelsTouchesInView = false; g.delaysTouchesBegan = false; g.delaysTouchesEnded = false
+                    g.delegate = g
+                    w.addGestureRecognizer(g)
+                }
+            }
+        }
+    }
+    override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+        for t in touches {
+            let p = t.location(in: view)
+            let hit = view?.hitTest(p, with: event)
+            var chain: [String] = []
+            var v = hit
+            while let x = v, chain.count < 4 { chain.append(String(describing: type(of: x)).prefix(40).description); v = x.superview }
+            DYLiveModel.log("DDTOUCH down \(String(format: "%.3f", Date().timeIntervalSince1970.truncatingRemainder(dividingBy: 100))) (\(Int(p.x)),\(Int(p.y))) hit=\(chain.joined(separator: "<"))")
+        }
+        state = .failed
+    }
+    func gestureRecognizer(_ g: UIGestureRecognizer, shouldRecognizeSimultaneouslyWith o: UIGestureRecognizer) -> Bool { true }
 }
 #endif
