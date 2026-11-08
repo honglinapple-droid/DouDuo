@@ -46,7 +46,9 @@ struct DYAweme: Identifiable, Codable, Equatable {
     var isPortrait: Bool {
         let v: Bool? = (width > 0 && height > 0) ? (height > width * 1.05) : nil
         let cw = coverW ?? 0, ch = coverH ?? 0
-        let c: Bool? = (cw > 0 && ch > 0) ? (ch > cw * 1.05) : nil
+        // b51：抖音现在的封面一律 720×720 正方形 → 原来「封面也得是竖的」让所有竖屏视频都被判成横屏，
+        // 竖屏优先模式下抖音给的个性化推荐几乎全被扔掉（手机日志：每页 20 条只剩 1 条）。正方形封面不参与判断
+        let c: Bool? = (cw > 0 && ch > 0 && abs(cw - ch) > min(cw, ch) * 0.05) ? (ch > cw * 1.05) : nil
         switch (v, c) {
         case let (v?, c?): return v && c
         case let (v?, nil): return v

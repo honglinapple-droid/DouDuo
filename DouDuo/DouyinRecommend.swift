@@ -237,7 +237,7 @@ final class DYRecommender {
         // 被配比挤掉的别浪费，扔回备用池（分数打折），下次人少了再上
         for a in dropped.prefix(10) { pool.append((a, p.score(a) - 1)) }
         if pool.count > 60 { pool.sort { $0.score > $1.score }; pool.removeLast(pool.count - 60) }
-        DYLiveModel.log("DDREC rank in=\(page.count) cands=\(cands.count) extras=\(extras.count) out=\(out.count) backfill=\(backfilled) follow=\(nFollow) land=\(nLand) pool=\(pool.count)")
+        DYLiveModel.log("DDREC rank in=\(page.count) portrait=\(page.filter { $0.isPortrait || !$0.images.isEmpty }.count) seen=\(page.filter { p.seen[$0.id] != nil }.count) cands=\(cands.count) extras=\(extras.count) out=\(out.count) backfill=\(backfilled) follow=\(nFollow) land=\(nLand) pool=\(pool.count)")
         return out
     }
 

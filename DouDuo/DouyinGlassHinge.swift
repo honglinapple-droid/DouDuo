@@ -68,6 +68,9 @@ struct DYHingeObserver: ViewModifier {
         if hinge == .none && pending == nil { hinge = h; return }
         // b50：折的过程中系统会不停报角度，状态没变也会回调。b49 每次回调都重新计时 → 手不停、计时就不停 → 折完 2–3 秒才跟过来。
         // 现在状态没变就不动计时器；回到当前状态就取消等待。
+        // b51：从合上打开时一律不进半折——展开途中路过的半折不算数，等到全开再说；半折只在「已经全开、再往回折」时才触发
+        var h = h
+        if h == .partiallyOpen && (hinge == .closed || hinge == .none) { h = hinge }
         if h == pending { return }
         if h == hinge { pending = nil; settleTask?.cancel(); return }
         pending = h
@@ -80,7 +83,13 @@ struct DYHingeObserver: ViewModifier {
             pending = nil
             let old = hinge
             guard old != p else { return }
-            withAnimation(DYHingeAnim.layout) {
+            // b51：合上 ↔ 全开不做任何布局动画（和作者原版一样，系统换屏就完了）；只有进出半折才动画
+            if old.isHalfOpen || p.isHalfOpen {
+                withAnimation(DYHingeAnim.layout) {
+                    hinge = p
+                    onSettle?(old, p)
+                }
+            } else {
                 hinge = p
                 onSettle?(old, p)
             }
