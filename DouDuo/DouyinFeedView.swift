@@ -1438,12 +1438,18 @@ struct DouyinFeedScreen: View {
         #endif
         var t = Transaction(); t.disablesAnimations = true
         withTransaction(t) { pageCovering = true; pageOpening = true }
-        withAnimation(.spring(response: 0.36, dampingFraction: 0.9)) { set() }
-        // b54：0.28 秒页面已基本到位（只差几十分之一），这时就放开点按。原来等动画完全结束（约 0.6 秒），
-        // 刚打开马上点返回 → 点了没反应，像卡住
+        // b54：滑入改成 0.24 秒减速（原来弹簧动画要 0.5 秒才算结束，这期间系统不让点页面里的按钮 → 刚打开马上点返回没反应）
+        withAnimation(.easeOut(duration: 0.24)) { set() }
+        // b54：只锁 0.15 秒——页面里的返回键约 0.1 秒就滑过顶栏标签的位置，之后再点不会误点到它。
+        // 原来等动画完全结束（约 0.6 秒）才放开，刚打开马上点返回 → 点了没反应，像卡住
         openSeq += 1
         let seq = openSeq
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.28) { if openSeq == seq { pageOpening = false } }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            #if DEBUG
+            DYLiveModel.log("DDTAP unlock \(Date().timeIntervalSince1970) seq=\(seq) now=\(openSeq)")
+            #endif
+            if openSeq == seq { pageOpening = false }
+        }
     }
 
     /// 收起：滑出到右边。右滑返回时页面已经被拖到屏幕外（DYFollowSwipeBack 先滑出再调这里），再往右移看不见，不会闪
